@@ -796,6 +796,11 @@ async function openKnownEntry(entry: KnownWorkspaceEntry, forceNewWindow: boolea
     return;
   }
 
+  if (shouldLaunchInWindowsLocalSession(entry)) {
+    await openEntryInWindowsLocalSession(entry, forceNewWindow);
+    return;
+  }
+
   const resolvedPath = await resolveEntryPath(entry);
   if (!resolvedPath) {
     throw new Error(`The workspace path "${entry.path}" is not accessible from this environment.`);
@@ -1337,6 +1342,10 @@ function shouldLaunchInWindowsWslSession(entry: KnownWorkspaceEntry): boolean {
     && (entry.path.startsWith('/') || isUncWslPath(entry.path));
 }
 
+function shouldLaunchInWindowsLocalSession(entry: KnownWorkspaceEntry): boolean {
+  return isWslEnvironment() && entry.origin === 'windows' && isWindowsPath(entry.path);
+}
+
 async function openEntryInWindowsWslSession(entry: KnownWorkspaceEntry): Promise<void> {
   const distro = entry.wslDistro;
   if (!distro) {
@@ -1367,6 +1376,16 @@ async function openEntryInWindowsWslSession(entry: KnownWorkspaceEntry): Promise
       );
     }
   }
+}
+
+async function openEntryInWindowsLocalSession(
+  entry: KnownWorkspaceEntry,
+  forceNewWindow: boolean
+): Promise<void> {
+  await runWindowsCodeCommand([
+    forceNewWindow ? '--new-window' : '--reuse-window',
+    entry.path
+  ]);
 }
 
 async function runWindowsCodeCommand(args: string[]): Promise<void> {
