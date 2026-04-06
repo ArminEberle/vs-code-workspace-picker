@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
 
 const execFileAsync = promisify(execFile);
 const STORAGE_FILE_NAME = 'known-workspaces.json';
+const EXTENSION_STORAGE_DIR = 'vs-code-workspace-picker';
 
 type EntryKind = 'folder' | 'workspace';
 type EntryOrigin = 'windows' | 'wsl' | 'linux' | 'macos' | 'unknown';
@@ -1259,7 +1260,7 @@ async function getSharedWindowsStoragePath(): Promise<string | undefined> {
       return undefined;
     }
 
-    return path.join(appData, 'Code', 'User', 'workspace-picker', STORAGE_FILE_NAME);
+    return path.join(appData, 'Code', 'User', EXTENSION_STORAGE_DIR, STORAGE_FILE_NAME);
   }
 
   if (!isWslEnvironment()) {
@@ -1273,7 +1274,7 @@ async function getSharedWindowsStoragePath(): Promise<string | undefined> {
       return undefined;
     }
 
-    return toWslPathFromWindows(path.join(windowsAppData, 'Code', 'User', 'workspace-picker', STORAGE_FILE_NAME));
+    return toWslPathFromWindows(path.join(windowsAppData, 'Code', 'User', EXTENSION_STORAGE_DIR, STORAGE_FILE_NAME));
   } catch {
     return undefined;
   }

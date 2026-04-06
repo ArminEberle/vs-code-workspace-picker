@@ -1,19 +1,31 @@
 {
-  "name": "workspace-picker",
-  "displayName": "Workspace Picker",
-  "description": "Keep a list of known workspaces and reopen them quickly from the File menu.",
+  "name": "vs-code-workspace-picker",
+  "displayName": "VS Code Workspace Picker",
+  "description": "A sidebar-based VS Code workspace launcher with WSL support, Git worktree creation, and quick switching between known workspaces.",
   "version": "0.0.1",
-  "publisher": "local",
+  "publisher": "ArminEberle",
   "license": "MIT",
+  "icon": "media/icon.png",
   "repository": {
     "type": "git",
-    "url": "file:///home/armin/work/private/vscode-workspace-picker"
+    "url": "git@github.com:ArminEberle/vs-code-workspace-picker.git"
   },
   "engines": {
     "vscode": "^1.90.0"
   },
   "categories": [
-    "Other"
+    "Other",
+    "SCM"
+  ],
+  "keywords": [
+    "workspace",
+    "workspaces",
+    "workspace switcher",
+    "wsl",
+    "git",
+    "worktree",
+    "repository",
+    "sidebar"
   ],
   "activationEvents": [
     "onView:workspacePicker.knownWorkspaces",
