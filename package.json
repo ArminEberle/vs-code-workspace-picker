@@ -6,9 +6,13 @@
   "publisher": "ArminEberle",
   "license": "MIT",
   "icon": "media/icon.png",
+  "homepage": "https://github.com/ArminEberle/vs-code-workspace-picker",
+  "bugs": {
+    "url": "https://github.com/ArminEberle/vs-code-workspace-picker/issues"
+  },
   "repository": {
     "type": "git",
-    "url": "git@github.com:ArminEberle/vs-code-workspace-picker.git"
+    "url": "https://github.com/ArminEberle/vs-code-workspace-picker.git"
   },
   "engines": {
     "vscode": "^1.90.0"

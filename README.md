@@ -1,6 +1,6 @@
 # Workspace Picker
 
-Workspace Picker is a VS Code extension for people who bounce between many folders, repositories, and `.code-workspace` files and want a faster way to reopen them.
+Workspace Picker is an opinionated VS Code extension for people who bounce between many folders, repositories, and `.code-workspace` files and want a faster way to reopen them.
 
 It adds a dedicated sidebar where you can keep a list of known workspaces, open them again quickly, inspect the current Git repo and branch for each entry, and create new Git worktrees without leaving VS Code.
 
@@ -77,6 +77,67 @@ To package it:
 ```bash
 npx @vscode/vsce package
 ```
+
+## Release
+
+For a first Marketplace release:
+
+```bash
+npm install
+npm run build
+npx @vscode/vsce login ArminEberle
+npx @vscode/vsce publish
+```
+
+This assumes:
+
+- you already created the `ArminEberle` publisher in the Visual Studio Marketplace
+- you already created an Azure DevOps Personal Access Token with Marketplace manage permissions
+
+If you want to upload manually instead of publishing directly from the CLI:
+
+```bash
+npm install
+npm run build
+npx @vscode/vsce package
+```
+
+Then upload the generated `.vsix` file in the Marketplace publisher portal.
+
+For later releases, bump the version and publish again:
+
+```bash
+npx @vscode/vsce publish patch
+```
+
+Or choose an explicit version:
+
+```bash
+npx @vscode/vsce publish 0.0.2
+```
+
+Useful links:
+
+- VS Code extension publishing docs: https://code.visualstudio.com/api/working-with-extensions/publishing-extension
+- Marketplace publisher management: https://marketplace.visualstudio.com/manage/publishers/
+
+## GitHub Actions
+
+This repository includes two GitHub Actions workflows:
+
+- `CI`: runs on pushes and pull requests, installs dependencies, and builds the extension
+- `Release`: packages a `.vsix` on demand and on version tags, uploads it as a workflow artifact, and creates a GitHub Release automatically for tags like `v0.0.2`
+
+To cut a GitHub release:
+
+```bash
+git tag v0.0.2
+git push origin v0.0.2
+```
+
+The release workflow will build the extension and attach the generated `.vsix` to the GitHub release.
+
+Marketplace publishing is still manual on purpose. That keeps the first public releases safer while the release process settles down.
 
 ## Contributing
 
