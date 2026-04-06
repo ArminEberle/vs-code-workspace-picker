@@ -31,6 +31,10 @@ Instead of relying only on `Open Recent`, Workspace Picker gives you a persisten
 - Store the workspace list in a way that can be shared between Windows and WSL when possible
 - Open WSL workspaces directly from a normal Windows VS Code session
 
+## Screenshot
+
+![Workspace Picker sidebar](docs/workspace-picker-screenshot.png)
+
 ## How It Works
 
 The extension lives in its own Activity Bar entry and opens a custom sidebar view.
@@ -75,7 +79,7 @@ Then press `F5` in VS Code.
 To package it:
 
 ```bash
-npx @vscode/vsce package
+npm run package:vsix
 ```
 
 ## Release
@@ -85,8 +89,8 @@ For a first Marketplace release:
 ```bash
 npm install
 npm run build
-npx @vscode/vsce login ArminEberle
-npx @vscode/vsce publish
+npx vsce login ArminEberle
+npm run publish:marketplace
 ```
 
 This assumes:
@@ -99,7 +103,7 @@ If you want to upload manually instead of publishing directly from the CLI:
 ```bash
 npm install
 npm run build
-npx @vscode/vsce package
+npm run package:vsix
 ```
 
 Then upload the generated `.vsix` file in the Marketplace publisher portal.
@@ -107,13 +111,13 @@ Then upload the generated `.vsix` file in the Marketplace publisher portal.
 For later releases, bump the version and publish again:
 
 ```bash
-npx @vscode/vsce publish patch
+npx vsce publish patch
 ```
 
 Or choose an explicit version:
 
 ```bash
-npx @vscode/vsce publish 0.0.2
+npx vsce publish 0.0.2
 ```
 
 Useful links:
@@ -126,18 +130,20 @@ Useful links:
 This repository includes two GitHub Actions workflows:
 
 - `CI`: runs on pushes and pull requests, installs dependencies, and builds the extension
-- `Release`: packages a `.vsix` on demand and on version tags, uploads it as a workflow artifact, and creates a GitHub Release automatically for tags like `v0.0.2`
+- `Release`: packages a `.vsix` on demand and on version tags, uploads it as a workflow artifact, creates a GitHub Release, and publishes to the Visual Studio Marketplace for tags like `v0.0.2`
+
+To enable Marketplace publishing from GitHub Actions, add this repository secret:
+
+- `VSCE_PAT`: an Azure DevOps Personal Access Token with `Marketplace > Manage` scope
 
 To cut a GitHub release:
 
 ```bash
-git tag v0.0.2
-git push origin v0.0.2
+npm version patch
+git push origin main --follow-tags
 ```
 
-The release workflow will build the extension and attach the generated `.vsix` to the GitHub release.
-
-Marketplace publishing is still manual on purpose. That keeps the first public releases safer while the release process settles down.
+The release workflow checks that the Git tag matches `package.json`, builds the extension, attaches the generated `.vsix` to the GitHub release, and publishes the same version to the Marketplace.
 
 ## Contributing
 

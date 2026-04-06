@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add a Marketplace screenshot to the README
+- Add a repo-only `DEVELOPING.md` with local development and release workflow documentation
+- Add npm scripts for packaging and Marketplace publishing with `vsce`
+- Automate GitHub Releases and Visual Studio Marketplace publishing via GitHub Actions on version tags
+- Tighten packaged extension contents with `.vscodeignore`
+
 ## 0.0.1
 
 - Initial public release

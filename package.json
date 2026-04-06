@@ -96,11 +96,14 @@
     "build": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "package": "npm run build",
+    "package:vsix": "vsce package",
+    "publish:marketplace": "vsce publish",
     "pretest": "npm run build"
   },
   "devDependencies": {
     "@types/node": "^22.15.2",
     "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.7.1",
     "typescript": "^5.8.3"
   }
 }
