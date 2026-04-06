@@ -1,0 +1,91 @@
+{
+  "name": "workspace-picker",
+  "displayName": "Workspace Picker",
+  "description": "Keep a list of known workspaces and reopen them quickly from the File menu.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "file:///home/armin/work/private/vscode-workspace-picker"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:workspacePicker.knownWorkspaces",
+    "onCommand:workspacePicker.openKnown"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "workspacePicker",
+          "title": "Workspace Picker",
+          "icon": "media/workspace-picker.svg"
+        }
+      ]
+    },
+    "views": {
+      "workspacePicker": [
+        {
+          "id": "workspacePicker.knownWorkspaces",
+          "name": "Known Workspaces",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "workspacePicker.openKnown",
+        "title": "Focus Known Workspaces"
+      },
+      {
+        "command": "workspacePicker.addNew",
+        "title": "Add New"
+      },
+      {
+        "command": "workspacePicker.addCurrent",
+        "title": "Add This"
+      },
+      {
+        "command": "workspacePicker.refresh",
+        "title": "Refresh"
+      },
+      {
+        "command": "workspacePicker.openEntry",
+        "title": "Open"
+      },
+      {
+        "command": "workspacePicker.openEntryInNewWindow",
+        "title": "Open in New Window"
+      },
+      {
+        "command": "workspacePicker.removeEntry",
+        "title": "Remove from List"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "workspacePicker.openKnown"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npm run build",
+    "pretest": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.2",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.8.3"
+  }
+}
