@@ -21,6 +21,7 @@ Useful commands:
 npm run build
 npm run watch
 npm run package:vsix
+npm run release:patch
 ```
 
 ## Project Files That Matter For Releases
@@ -96,7 +97,40 @@ The intended release flow is:
 1. Make your code changes.
 2. Update `README.md` if user-visible behavior changed.
 3. Update `CHANGELOG.md`.
-4. Bump the extension version:
+4. Commit your changes.
+5. Run the local release command.
+
+### Bash
+
+```bash
+npm run release:patch
+```
+
+### Windows batch
+
+```bat
+scripts\release.cmd patch
+```
+
+You can also use `minor` or `major` instead of `patch`.
+
+These commands:
+
+- verify the working tree is clean
+- run `npm version <type>`
+- push `main` with `--follow-tags`
+
+If you need a different branch, the scripts also accept one:
+
+```bash
+scripts/release.sh patch release-branch
+```
+
+```bat
+scripts\release.cmd patch release-branch
+```
+
+If you want to run the steps manually instead, the equivalent flow is:
 
 ```bash
 npm version patch
@@ -104,7 +138,7 @@ npm version patch
 
 This updates `package.json`, updates `package-lock.json`, creates a Git commit, and creates a Git tag like `v0.0.2`.
 
-5. Push the branch and tag:
+Then push the branch and tag:
 
 ```bash
 git push origin main --follow-tags
@@ -112,8 +146,9 @@ git push origin main --follow-tags
 
 If your default branch is not `main`, replace it with your actual branch name.
 
-6. GitHub Actions will run the `Release` workflow automatically.
-7. If the workflow succeeds, the same version will be:
+GitHub Actions will run the `Release` workflow automatically.
+
+If the workflow succeeds, the same version will be:
 
 - packaged as a `.vsix`
 - attached to a GitHub Release
@@ -135,6 +170,28 @@ If you want to publish manually from your machine:
 npx vsce login ArminEberle
 npm run publish:marketplace
 ```
+
+This assumes:
+
+- you already created the `ArminEberle` publisher in the Visual Studio Marketplace
+- you already created an Azure DevOps Personal Access Token with `Marketplace > Manage` scope
+- you are signed in with the same Microsoft account for Azure DevOps and the Marketplace publisher
+
+If you want to upload manually instead of publishing directly from the CLI:
+
+```bash
+npm install
+npm run build
+npm run package:vsix
+```
+
+Then upload the generated `.vsix` file in the Marketplace publisher portal.
+
+Useful links:
+
+- VS Code extension publishing docs: https://code.visualstudio.com/api/working-with-extensions/publishing-extension
+- Marketplace publisher management: https://marketplace.visualstudio.com/manage/publishers/
+- Azure DevOps: https://dev.azure.com/
 
 ## Important Guardrails
 

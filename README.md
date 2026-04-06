@@ -82,69 +82,6 @@ To package it:
 npm run package:vsix
 ```
 
-## Release
-
-For a first Marketplace release:
-
-```bash
-npm install
-npm run build
-npx vsce login ArminEberle
-npm run publish:marketplace
-```
-
-This assumes:
-
-- you already created the `ArminEberle` publisher in the Visual Studio Marketplace
-- you already created an Azure DevOps Personal Access Token with Marketplace manage permissions
-
-If you want to upload manually instead of publishing directly from the CLI:
-
-```bash
-npm install
-npm run build
-npm run package:vsix
-```
-
-Then upload the generated `.vsix` file in the Marketplace publisher portal.
-
-For later releases, bump the version and publish again:
-
-```bash
-npx vsce publish patch
-```
-
-Or choose an explicit version:
-
-```bash
-npx vsce publish 0.0.2
-```
-
-Useful links:
-
-- VS Code extension publishing docs: https://code.visualstudio.com/api/working-with-extensions/publishing-extension
-- Marketplace publisher management: https://marketplace.visualstudio.com/manage/publishers/
-
-## GitHub Actions
-
-This repository includes two GitHub Actions workflows:
-
-- `CI`: runs on pushes and pull requests, installs dependencies, and builds the extension
-- `Release`: packages a `.vsix` on demand and on version tags, uploads it as a workflow artifact, creates a GitHub Release, and publishes to the Visual Studio Marketplace for tags like `v0.0.2`
-
-To enable Marketplace publishing from GitHub Actions, add this repository secret:
-
-- `VSCE_PAT`: an Azure DevOps Personal Access Token with `Marketplace > Manage` scope
-
-To cut a GitHub release:
-
-```bash
-npm version patch
-git push origin main --follow-tags
-```
-
-The release workflow checks that the Git tag matches `package.json`, builds the extension, attaches the generated `.vsix` to the GitHub release, and publishes the same version to the Marketplace.
-
 ## Contributing
 
 Contributions are welcome, but please keep the spirit of the project intact.

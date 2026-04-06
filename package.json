@@ -98,6 +98,9 @@
     "package": "npm run build",
     "package:vsix": "vsce package",
     "publish:marketplace": "vsce publish",
+    "release:patch": "bash scripts/release.sh patch",
+    "release:minor": "bash scripts/release.sh minor",
+    "release:major": "bash scripts/release.sh major",
     "pretest": "npm run build"
   },
   "devDependencies": {
