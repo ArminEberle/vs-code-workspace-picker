@@ -19,18 +19,29 @@ interface KnownWorkspaceEntry {
   addedAt: string;
   origin: EntryOrigin;
   wslDistro?: string;
+  cachedGitInfo?: CachedGitInfo;
 }
 
 interface StoredData {
-  version: 1;
+  version: 2;
   entries: KnownWorkspaceEntry[];
+  groupOrder: string[];
+}
+
+interface CachedGitInfo {
+  repoName?: string;
+  branch?: string;
+  remoteGroupKey?: string;
+  remoteLabel?: string;
 }
 
 interface GitInfo {
   repoName: string;
   branch: string;
-  stagedCount: number;
-  unstagedCount: number;
+  stagedCount?: number;
+  unstagedCount?: number;
+  remoteGroupKey?: string;
+  remoteLabel?: string;
 }
 
 interface EntryPresentation {
@@ -43,12 +54,12 @@ interface EntryPresentation {
 
 type WebviewMessage =
   | { type: 'ready' }
-  | { type: 'addNew' }
   | { type: 'addNewWorktree' }
   | { type: 'addCurrent' }
   | { type: 'refresh' }
   | { type: 'openEntry'; id: string; newWindow: boolean }
   | { type: 'reorderEntries'; ids: string[] }
+  | { type: 'reorderGroups'; groupIds: string[] }
   | { type: 'removeEntry'; id: string }
   | { type: 'deleteAndRemoveEntry'; id: string };
 
@@ -92,10 +103,6 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
         case 'refresh':
           await this.postState();
           return;
-        case 'addNew':
-          await addNewEntries(this.store);
-          await this.postState();
-          return;
         case 'addNewWorktree':
           await addNewWorktree(this.store);
           await this.postState();
@@ -117,6 +124,10 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
         }
         case 'reorderEntries':
           await this.store.reorder(message.ids);
+          await this.postState();
+          return;
+        case 'reorderGroups':
+          await this.store.reorderGroups(message.groupIds);
           await this.postState();
           return;
         case 'removeEntry': {
@@ -150,10 +161,12 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
 
     const token = ++this.stateToken;
     const entries = await this.store.list();
+    const groupOrder = await this.store.getGroupOrder();
     const presentation = await Promise.all(entries.map((entry) => buildBasicEntryPresentation(entry, this.store)));
     await this.view.webview.postMessage({
       type: 'state',
-      entries: presentation
+      entries: presentation,
+      groupOrder
     });
 
     void this.hydrateGitInfo(entries, token);
@@ -164,6 +177,8 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
       id: entry.id,
       gitInfo: await detectGitInfo(entry, this.store)
     })));
+
+    await this.store.updateGitInfoCache(enriched);
 
     if (!this.view || token !== this.stateToken) {
       return;
@@ -254,6 +269,65 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
     .list {
       display: grid;
       gap: 8px;
+    }
+
+    .group {
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 10px;
+      overflow: hidden;
+      background: color-mix(in srgb, var(--vscode-sideBar-background) 90%, var(--vscode-editor-background));
+    }
+
+    .group.dragging {
+      opacity: 0.55;
+    }
+
+    .group.drag-over {
+      border-color: var(--vscode-focusBorder);
+      box-shadow: inset 0 0 0 1px var(--vscode-focusBorder);
+    }
+
+    .group summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 10px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      user-select: none;
+      background: color-mix(in srgb, var(--vscode-sideBar-background) 82%, var(--vscode-editor-background));
+    }
+
+    .group summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .group-title {
+      font-weight: 600;
+      min-width: 0;
+      word-break: break-word;
+    }
+
+    .group-head {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 10px;
+      align-items: center;
+      min-width: 0;
+      flex: 1;
+    }
+
+    .group-meta {
+      color: var(--vscode-descriptionForeground);
+      white-space: nowrap;
+      font-size: 0.95em;
+    }
+
+    .group-list {
+      display: grid;
+      gap: 8px;
+      padding: 8px;
     }
 
     .entry.dragging {
@@ -361,9 +435,8 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
 <body>
   <div class="app">
     <div class="actions">
-      <button class="button primary" data-action="add-new">Add New</button>
+      <button class="button primary" data-action="add-current">Add This</button>
       <button class="button" data-action="add-new-worktree">Add New Worktree</button>
-      <button class="button" data-action="add-current">Add This</button>
       <button class="button" data-action="refresh">Refresh</button>
     </div>
     <div id="content"></div>
@@ -373,23 +446,31 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
     const vscode = acquireVsCodeApi();
     const content = document.getElementById('content');
     let entriesState = [];
+    let groupOrderState = [];
     let draggingId = null;
+    let draggingType = null;
+    const openGroups = new Map();
 
-    function render(entries) {
+    function render(entries, groupOrder) {
       entriesState = entries;
+      groupOrderState = groupOrder;
 
       if (entries.length === 0) {
-        content.innerHTML = '<div class="empty">No known workspaces yet. Use Add New or Add This to get started.</div>';
+        content.innerHTML = '<div class="empty">No known workspaces yet. Use Add This to get started.</div>';
         return;
       }
 
-      const html = entries.map((item) => {
+      const groups = groupEntries(entries, groupOrder);
+      const html = groups.map((group) => {
+        const groupId = escapeAttribute(group.id);
+        const isOpen = openGroups.has(group.id) ? openGroups.get(group.id) : false;
+        const groupEntriesHtml = group.entries.map((item) => {
         const id = escapeAttribute(item.entry.id);
         const title = escapeHtml(item.label);
         const meta = escapeHtml(item.gitInfo
-          ? item.gitInfo.repoName + ' • ' + item.gitInfo.branch
+          ? [item.gitInfo.repoName, item.gitInfo.branch].filter(Boolean).join(' • ')
           : item.originLabel);
-        const gitCounts = item.gitInfo
+        const gitCounts = item.gitInfo && typeof item.gitInfo.stagedCount === 'number' && typeof item.gitInfo.unstagedCount === 'number'
           ? '<div class="entry-meta">Staged: ' + item.gitInfo.stagedCount + ' • Unstaged: ' + item.gitInfo.unstagedCount + '</div>'
           : '';
         const entryPath = escapeHtml(item.entry.path);
@@ -397,9 +478,9 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
         const inaccessibleNote = item.accessible ? '' : ' • not accessible from this environment';
 
         return \`
-          <div class="entry" draggable="true" data-entry-id="\${id}">
+          <div class="entry" data-entry-id="\${id}">
             <div class="entry-top">
-              <button class="drag-handle" title="Drag to reorder" aria-label="Drag to reorder">⋮⋮</button>
+              <button class="drag-handle" draggable="true" data-drag-kind="entry" title="Drag to reorder" aria-label="Drag to reorder">⋮⋮</button>
               <div class="entry-main">
                 <div class="entry-header">
                   <div class="entry-title">\${title}</div>
@@ -419,7 +500,53 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
         \`;
       }).join('');
 
+        return \`
+          <details class="group" data-group-id="\${groupId}" \${isOpen ? 'open' : ''}>
+            <summary>
+              <span class="group-head">
+                <button class="drag-handle" draggable="true" data-drag-kind="group" title="Drag group to reorder" aria-label="Drag group to reorder">⋮⋮</button>
+                <span class="group-title">\${escapeHtml(group.label)}</span>
+              </span>
+              <span class="group-meta">\${group.entries.length} workspace\${group.entries.length === 1 ? '' : 's'}</span>
+            </summary>
+            <div class="group-list">
+              \${groupEntriesHtml}
+            </div>
+          </details>
+        \`;
+      }).join('');
+
       content.innerHTML = '<div class="list">' + html + '</div>';
+    }
+
+    function groupEntries(entries, groupOrder) {
+      const groups = [];
+      const byId = new Map();
+
+      for (const entry of entries) {
+        const remoteKey = entry.gitInfo && entry.gitInfo.remoteGroupKey ? entry.gitInfo.remoteGroupKey : '__no_remote__';
+        const groupId = remoteKey;
+        if (!byId.has(groupId)) {
+          const label = entry.gitInfo && entry.gitInfo.remoteLabel
+            ? entry.gitInfo.remoteLabel
+            : 'Other Workspaces';
+          const group = { id: groupId, label, entries: [] };
+          byId.set(groupId, group);
+          groups.push(group);
+        }
+
+        byId.get(groupId).entries.push(entry);
+      }
+
+      const orderMap = new Map(groupOrder.map((groupId, index) => [groupId, index]));
+      return groups.sort((left, right) => {
+        const leftIndex = orderMap.has(left.id) ? orderMap.get(left.id) : Number.MAX_SAFE_INTEGER;
+        const rightIndex = orderMap.has(right.id) ? orderMap.get(right.id) : Number.MAX_SAFE_INTEGER;
+        if (leftIndex !== rightIndex) {
+          return leftIndex - rightIndex;
+        }
+        return 0;
+      });
     }
 
     document.addEventListener('click', (event) => {
@@ -435,11 +562,6 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
 
       const action = actionHost.dataset.action;
       const id = actionHost.dataset.id;
-
-      if (action === 'add-new') {
-        vscode.postMessage({ type: 'addNew' });
-        return;
-      }
 
       if (action === 'add-current') {
         vscode.postMessage({ type: 'addCurrent' });
@@ -486,16 +608,43 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      const entry = target.closest('[data-entry-id]');
-      if (!(entry instanceof HTMLElement)) {
+      const dragHandle = target.closest('[data-drag-kind]');
+      if (!(dragHandle instanceof HTMLElement)) {
         return;
       }
 
-      draggingId = entry.dataset.entryId || null;
-      entry.classList.add('dragging');
-      if (event.dataTransfer) {
-        event.dataTransfer.effectAllowed = 'move';
-        event.dataTransfer.setData('text/plain', draggingId || '');
+      const dragKind = dragHandle.dataset.dragKind;
+
+      if (dragKind === 'entry') {
+        const entry = dragHandle.closest('[data-entry-id]');
+        if (!(entry instanceof HTMLElement)) {
+          return;
+        }
+
+        draggingType = 'entry';
+        draggingId = entry.dataset.entryId || null;
+        entry.classList.add('dragging');
+        if (event.dataTransfer) {
+          event.dataTransfer.effectAllowed = 'move';
+          event.dataTransfer.setData('text/plain', draggingId || '');
+        }
+        return;
+      }
+
+      if (dragKind === 'group') {
+        const group = dragHandle.closest('[data-group-id]');
+        if (!(group instanceof HTMLElement)) {
+          return;
+        }
+
+        draggingType = 'group';
+        draggingId = group.dataset.groupId || null;
+        group.classList.add('dragging');
+        if (event.dataTransfer) {
+          event.dataTransfer.effectAllowed = 'move';
+          event.dataTransfer.setData('text/plain', draggingId || '');
+        }
+        return;
       }
     });
 
@@ -503,9 +652,33 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
       clearDragState();
     });
 
+    content.addEventListener('toggle', (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLDetailsElement) || !target.matches('.group')) {
+        return;
+      }
+
+      const groupId = target.dataset.groupId;
+      if (groupId) {
+        openGroups.set(groupId, target.open);
+      }
+    }, true);
+
     content.addEventListener('dragover', (event) => {
       const target = event.target;
       if (!(target instanceof HTMLElement)) {
+        return;
+      }
+
+      if (draggingType === 'group') {
+        const group = target.closest('[data-group-id]');
+        if (!(group instanceof HTMLElement) || !draggingId || group.dataset.groupId === draggingId) {
+          return;
+        }
+
+        event.preventDefault();
+        clearDropMarkers();
+        group.classList.add('drag-over');
         return;
       }
 
@@ -525,6 +698,11 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
+      const group = target.closest('[data-group-id]');
+      if (group instanceof HTMLElement) {
+        group.classList.remove('drag-over');
+      }
+
       const entry = target.closest('[data-entry-id]');
       if (entry instanceof HTMLElement) {
         entry.classList.remove('drag-over');
@@ -534,6 +712,25 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
     content.addEventListener('drop', (event) => {
       const target = event.target;
       if (!(target instanceof HTMLElement)) {
+        return;
+      }
+
+      if (draggingType === 'group') {
+        const group = target.closest('[data-group-id]');
+        if (!(group instanceof HTMLElement) || !draggingId) {
+          return;
+        }
+
+        event.preventDefault();
+        const targetGroupId = group.dataset.groupId;
+        if (!targetGroupId || targetGroupId === draggingId) {
+          clearDragState();
+          return;
+        }
+
+        const reorderedGroupIds = reorderGroupList(groupEntries(entriesState, groupOrderState).map((group) => group.id), draggingId, targetGroupId);
+        clearDragState();
+        vscode.postMessage({ type: 'reorderGroups', groupIds: reorderedGroupIds });
         return;
       }
 
@@ -557,7 +754,7 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
     window.addEventListener('message', (event) => {
       const message = event.data;
       if (message.type === 'state') {
-        render(message.entries);
+        render(message.entries, message.groupOrder || []);
         return;
       }
 
@@ -567,7 +764,7 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
           ...entry,
           gitInfo: byId.has(entry.entry.id) ? byId.get(entry.entry.id) : entry.gitInfo
         }));
-        render(entriesState);
+        render(entriesState, groupOrderState);
       }
     });
 
@@ -579,6 +776,7 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
 
     function clearDragState() {
       draggingId = null;
+      draggingType = null;
       clearDropMarkers();
       for (const element of content.querySelectorAll('.dragging')) {
         element.classList.remove('dragging');
@@ -596,6 +794,19 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
       const [moved] = reordered.splice(fromIndex, 1);
       reordered.splice(toIndex, 0, moved);
       return reordered;
+    }
+
+    function reorderGroupList(groupIds, draggedGroupId, targetGroupId) {
+      const reorderedGroups = groupIds.slice();
+      const fromIndex = reorderedGroups.indexOf(draggedGroupId);
+      const toIndex = reorderedGroups.indexOf(targetGroupId);
+      if (fromIndex < 0 || toIndex < 0) {
+        return reorderedGroups;
+      }
+
+      const [moved] = reorderedGroups.splice(fromIndex, 1);
+      reorderedGroups.splice(toIndex, 0, moved);
+      return reorderedGroups;
     }
 
     function escapeHtml(value) {
@@ -627,14 +838,6 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand('workspacePicker.openKnown', async () => {
       await provider.reveal();
-    }),
-    vscode.commands.registerCommand('workspacePicker.addNew', async () => {
-      try {
-        await addNewEntries(store);
-        await provider.refresh();
-      } catch (error) {
-        void vscode.window.showErrorMessage(asErrorMessage(error));
-      }
     }),
     vscode.commands.registerCommand('workspacePicker.addNewWorktree', async () => {
       try {
@@ -677,31 +880,22 @@ async function buildBasicEntryPresentation(
 ): Promise<EntryPresentation> {
   const resolvedPath = await store.resolveEntryPath(entry);
   const accessible = resolvedPath ? await pathExists(resolvedPath) : false;
+  const cachedGitInfo = entry.cachedGitInfo
+    ? {
+        repoName: entry.cachedGitInfo.repoName ?? getEntryLabel(entry),
+        branch: entry.cachedGitInfo.branch ?? '',
+        remoteGroupKey: entry.cachedGitInfo.remoteGroupKey,
+        remoteLabel: entry.cachedGitInfo.remoteLabel
+      }
+    : undefined;
 
   return {
     entry,
     label: getEntryLabel(entry),
+    gitInfo: cachedGitInfo,
     accessible,
     originLabel: getOriginLabel(entry)
   };
-}
-
-async function addNewEntries(store: KnownWorkspaceStore): Promise<void> {
-  const uris = await vscode.window.showOpenDialog({
-    canSelectFiles: true,
-    canSelectFolders: true,
-    canSelectMany: true,
-    openLabel: 'Add to known workspaces',
-    filters: {
-      'VS Code Workspace': ['code-workspace']
-    }
-  });
-
-  if (!uris || uris.length === 0) {
-    return;
-  }
-
-  await store.addUris(uris);
 }
 
 async function addCurrentEntry(store: KnownWorkspaceStore): Promise<boolean> {
@@ -830,12 +1024,43 @@ async function detectGitInfo(
 
     const { stdout: branchStdout } = await execFileAsync('git', ['-C', probePath, 'rev-parse', '--abbrev-ref', 'HEAD']);
     const { stdout: statusStdout } = await execFileAsync('git', ['-C', probePath, 'status', '--porcelain=v1']);
+    const remoteInfo = await detectRemoteInfo(probePath);
     const statusCounts = countGitStatusEntries(statusStdout);
     return {
       repoName: path.basename(repoRoot),
       branch: branchStdout.trim() || 'HEAD',
       stagedCount: statusCounts.stagedCount,
-      unstagedCount: statusCounts.unstagedCount
+      unstagedCount: statusCounts.unstagedCount,
+      remoteGroupKey: remoteInfo?.key,
+      remoteLabel: remoteInfo?.label
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+async function detectRemoteInfo(probePath: string): Promise<{ key: string; label: string } | undefined> {
+  try {
+    const { stdout: remotesStdout } = await execFileAsync('git', ['-C', probePath, 'remote']);
+    const remotes = remotesStdout
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    if (remotes.length === 0) {
+      return undefined;
+    }
+
+    const preferredRemote = remotes.includes('origin') ? 'origin' : remotes[0];
+    const { stdout: urlStdout } = await execFileAsync('git', ['-C', probePath, 'remote', 'get-url', preferredRemote]);
+    const remoteUrl = urlStdout.trim();
+    if (!remoteUrl) {
+      return undefined;
+    }
+
+    return {
+      key: normalizeRemoteUrl(remoteUrl),
+      label: formatRemoteLabel(remoteUrl)
     };
   } catch {
     return undefined;
@@ -1081,12 +1306,33 @@ function sanitizeForPathSegment(value: string): string {
     || 'worktree';
 }
 
+function normalizeRemoteUrl(remoteUrl: string): string {
+  let normalized = remoteUrl.trim().toLowerCase();
+  normalized = normalized.replace(/^ssh:\/\//, '');
+  normalized = normalized.replace(/^git@/, '');
+  normalized = normalized.replace(/^https?:\/\//, '');
+  normalized = normalized.replace(/:/, '/');
+  normalized = normalized.replace(/\.git$/, '');
+  return normalized;
+}
+
+function formatRemoteLabel(remoteUrl: string): string {
+  const normalized = normalizeRemoteUrl(remoteUrl);
+  const match = normalized.match(/([^/]+\/[^/]+)$/);
+  return match?.[1] ?? remoteUrl;
+}
+
 class KnownWorkspaceStore {
   constructor(private readonly context: vscode.ExtensionContext) {}
 
   async list(): Promise<KnownWorkspaceEntry[]> {
     const data = await this.read();
     return data.entries;
+  }
+
+  async getGroupOrder(): Promise<string[]> {
+    const data = await this.read();
+    return data.groupOrder;
   }
 
   async findById(id: string): Promise<KnownWorkspaceEntry | undefined> {
@@ -1149,6 +1395,55 @@ class KnownWorkspaceStore {
     await this.write(data);
   }
 
+  async reorderGroups(groupIds: string[]): Promise<void> {
+    const data = await this.read();
+    const remaining = data.groupOrder.filter((groupId) => !groupIds.includes(groupId));
+    data.groupOrder = [...groupIds, ...remaining];
+    await this.write(data);
+  }
+
+  async updateGitInfoCache(updates: Array<{ id: string; gitInfo?: GitInfo }>): Promise<void> {
+    if (updates.length === 0) {
+      return;
+    }
+
+    const data = await this.read();
+    const updateMap = new Map(updates.map((update) => [update.id, update.gitInfo]));
+    let changed = false;
+
+    data.entries = data.entries.map((entry) => {
+      if (!updateMap.has(entry.id)) {
+        return entry;
+      }
+
+      const gitInfo = updateMap.get(entry.id);
+      const nextCachedGitInfo = gitInfo
+        ? {
+            repoName: gitInfo.repoName,
+            branch: gitInfo.branch,
+            remoteGroupKey: gitInfo.remoteGroupKey,
+            remoteLabel: gitInfo.remoteLabel
+          }
+        : undefined;
+
+      const currentCache = entry.cachedGitInfo;
+      const isSame = JSON.stringify(currentCache ?? null) === JSON.stringify(nextCachedGitInfo ?? null);
+      if (isSame) {
+        return entry;
+      }
+
+      changed = true;
+      return {
+        ...entry,
+        cachedGitInfo: nextCachedGitInfo
+      };
+    });
+
+    if (changed) {
+      await this.write(data);
+    }
+  }
+
   async resolveEntryPath(entry: KnownWorkspaceEntry): Promise<string | undefined> {
     return resolveEntryPath(entry);
   }
@@ -1160,15 +1455,19 @@ class KnownWorkspaceStore {
       const raw = await fs.readFile(filePath, 'utf8');
       const parsed = JSON.parse(raw) as Partial<StoredData>;
       return {
-        version: 1,
-        entries: Array.isArray(parsed.entries) ? parsed.entries.filter(isKnownWorkspaceEntry) : []
+        version: 2,
+        entries: Array.isArray(parsed.entries) ? parsed.entries.filter(isKnownWorkspaceEntry) : [],
+        groupOrder: Array.isArray(parsed.groupOrder)
+          ? parsed.groupOrder.filter((value): value is string => typeof value === 'string')
+          : []
       };
     } catch (error) {
       const nodeError = error as NodeJS.ErrnoException;
       if (nodeError.code === 'ENOENT') {
         return {
-          version: 1,
-          entries: []
+          version: 2,
+          entries: [],
+          groupOrder: []
         };
       }
 
@@ -1193,7 +1492,20 @@ function isKnownWorkspaceEntry(value: unknown): value is KnownWorkspaceEntry {
     && typeof candidate.path === 'string'
     && (candidate.kind === 'folder' || candidate.kind === 'workspace')
     && typeof candidate.addedAt === 'string'
-    && typeof candidate.origin === 'string';
+    && typeof candidate.origin === 'string'
+    && (candidate.cachedGitInfo === undefined || isCachedGitInfo(candidate.cachedGitInfo));
+}
+
+function isCachedGitInfo(value: unknown): value is CachedGitInfo {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const candidate = value as Partial<CachedGitInfo>;
+  return (candidate.repoName === undefined || typeof candidate.repoName === 'string')
+    && (candidate.branch === undefined || typeof candidate.branch === 'string')
+    && (candidate.remoteGroupKey === undefined || typeof candidate.remoteGroupKey === 'string')
+    && (candidate.remoteLabel === undefined || typeof candidate.remoteLabel === 'string');
 }
 
 function createEntry(entryPath: string, kind: EntryKind): KnownWorkspaceEntry {

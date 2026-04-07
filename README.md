@@ -20,8 +20,8 @@ Instead of relying only on `Open Recent`, Workspace Picker gives you a persisten
 ## Features
 
 - Sidebar-based workspace launcher
-- Add a folder or `.code-workspace` file to the known list
 - Add the current folder or workspace with one click
+- Group workspaces by remote repository in accordion sections when a remote exists
 - Open a known entry in the current window or a new window
 - Drag entries to reorder them in the sidebar
 - Remove one or many entries from the list
@@ -39,11 +39,12 @@ Instead of relying only on `Open Recent`, Workspace Picker gives you a persisten
 
 The extension lives in its own Activity Bar entry and opens a custom sidebar view.
 
+Known workspaces are grouped by remote repository when one can be detected. Repositories without a remote, plus non-git entries, appear in a fallback group.
+
 From that sidebar you can:
 
-- `Add New`: add folders or `.code-workspace` files manually
-- `Add New Worktree`: create a sibling Git worktree from the current repository
 - `Add This`: add the current folder or workspace
+- `Add New Worktree`: create a sibling Git worktree from the current repository
 - `Refresh`: reload the sidebar state
 
 Each listed workspace also has row-level actions:

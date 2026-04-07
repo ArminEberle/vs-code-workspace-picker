@@ -60,10 +60,6 @@
         "title": "Focus Known Workspaces"
       },
       {
-        "command": "workspacePicker.addNew",
-        "title": "Add New"
-      },
-      {
         "command": "workspacePicker.addCurrent",
         "title": "Add This"
       },
