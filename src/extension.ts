@@ -162,11 +162,13 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
     const token = ++this.stateToken;
     const entries = await this.store.list();
     const groupOrder = await this.store.getGroupOrder();
+    const canAddCurrent = !await hasCurrentWorkspaceEntry(entries, this.store);
     const presentation = await Promise.all(entries.map((entry) => buildBasicEntryPresentation(entry, this.store)));
     await this.view.webview.postMessage({
       type: 'state',
       entries: presentation,
-      groupOrder
+      groupOrder,
+      canAddCurrent
     });
 
     void this.hydrateCurrentWorkspaceGitInfo(entries, token);
@@ -448,15 +450,23 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const content = document.getElementById('content');
+    const addCurrentButton = document.querySelector('[data-action="add-current"]');
     let entriesState = [];
     let groupOrderState = [];
+    let canAddCurrentState = true;
     let draggingId = null;
     let draggingType = null;
     const openGroups = new Map();
 
-    function render(entries, groupOrder) {
+    function render(entries, groupOrder, canAddCurrent) {
       entriesState = entries;
       groupOrderState = groupOrder;
+      canAddCurrentState = canAddCurrent;
+
+      if (addCurrentButton instanceof HTMLButtonElement) {
+        addCurrentButton.disabled = !canAddCurrentState;
+        addCurrentButton.title = canAddCurrentState ? '' : 'The current workspace is already in the list';
+      }
 
       if (entries.length === 0) {
         content.innerHTML = '<div class="empty">No known workspaces yet. Use Add This to get started.</div>';
@@ -757,7 +767,7 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
     window.addEventListener('message', (event) => {
       const message = event.data;
       if (message.type === 'state') {
-        render(message.entries, message.groupOrder || []);
+        render(message.entries, message.groupOrder || [], message.canAddCurrent !== false);
         return;
       }
 
@@ -767,7 +777,7 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
           ...entry,
           gitInfo: byId.has(entry.entry.id) ? byId.get(entry.entry.id) : entry.gitInfo
         }));
-        render(entriesState, groupOrderState);
+        render(entriesState, groupOrderState, canAddCurrentState);
       }
     });
 
@@ -940,6 +950,13 @@ async function findCurrentWorkspaceEntry(
   }
 
   return undefined;
+}
+
+async function hasCurrentWorkspaceEntry(
+  entries: KnownWorkspaceEntry[],
+  store: KnownWorkspaceStore
+): Promise<boolean> {
+  return Boolean(await findCurrentWorkspaceEntry(entries, store));
 }
 
 async function addNewWorktree(store: KnownWorkspaceStore): Promise<void> {
