@@ -50,6 +50,7 @@ interface EntryPresentation {
   gitInfo?: GitInfo;
   accessible: boolean;
   originLabel: string;
+  isCurrentWorkspace: boolean;
 }
 
 type WebviewMessage =
@@ -63,11 +64,23 @@ type WebviewMessage =
   | { type: 'removeEntry'; id: string }
   | { type: 'deleteAndRemoveEntry'; id: string };
 
+interface GitExtensionApi {
+  repositories: GitRepository[];
+  onDidOpenRepository(listener: (repository: GitRepository) => void): vscode.Disposable;
+}
+
+interface GitRepository {
+  state: GitRepositoryState;
+}
+
+interface GitRepositoryState {
+  onDidChange(listener: () => void): vscode.Disposable;
+}
+
 class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'workspacePicker.knownWorkspaces';
 
   private view?: vscode.WebviewView;
-  private stateToken = 0;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -159,7 +172,6 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const token = ++this.stateToken;
     const entries = await this.store.list();
     const groupOrder = await this.store.getGroupOrder();
     const canAddCurrent = !await hasCurrentWorkspaceEntry(entries, this.store);
@@ -169,29 +181,6 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
       entries: presentation,
       groupOrder,
       canAddCurrent
-    });
-
-    void this.hydrateCurrentWorkspaceGitInfo(entries, token);
-  }
-
-  private async hydrateCurrentWorkspaceGitInfo(entries: KnownWorkspaceEntry[], token: number): Promise<void> {
-    const currentEntry = await findCurrentWorkspaceEntry(entries, this.store);
-    if (!currentEntry) {
-      return;
-    }
-
-    const gitInfo = await detectGitInfo(currentEntry, this.store);
-    const enriched: Array<{ id: string; gitInfo?: GitInfo }> = [{ id: currentEntry.id, gitInfo }];
-
-    await this.store.updateGitInfoCache(enriched);
-
-    if (!this.view || token !== this.stateToken) {
-      return;
-    }
-
-    await this.view.webview.postMessage({
-      type: 'gitInfo',
-      entries: enriched
     });
   }
 
@@ -401,6 +390,21 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
       word-break: break-word;
     }
 
+    .entry-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid color-mix(in srgb, var(--vscode-focusBorder) 70%, transparent);
+      background: color-mix(in srgb, var(--vscode-focusBorder) 14%, transparent);
+      color: var(--vscode-foreground);
+      font-size: 0.9em;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
     .entry-path {
       color: var(--vscode-descriptionForeground);
       word-break: break-all;
@@ -486,6 +490,15 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
         const gitCounts = item.gitInfo && typeof item.gitInfo.stagedCount === 'number' && typeof item.gitInfo.unstagedCount === 'number'
           ? '<div class="entry-meta">Staged: ' + item.gitInfo.stagedCount + ' • Unstaged: ' + item.gitInfo.unstagedCount + '</div>'
           : '';
+        const currentBadge = item.isCurrentWorkspace
+          ? '<div class="entry-badge">YOU ARE HERE</div>'
+          : '';
+        const actionButtons = item.isCurrentWorkspace
+          ? '<button class="mini-button remove" data-action="remove-one" data-id="' + id + '">Remove</button>'
+          : '<button class="mini-button" data-action="open-current" data-id="' + id + '">Open Here</button>'
+            + '<button class="mini-button" data-action="open-new" data-id="' + id + '">Open New Window</button>'
+            + '<button class="mini-button remove" data-action="remove-one" data-id="' + id + '">Remove</button>'
+            + '<button class="mini-button remove" data-action="delete-remove-one" data-id="' + id + '">Delete and Remove</button>';
         const entryPath = escapeHtml(item.entry.path);
         const pathClass = item.accessible ? 'entry-path' : 'entry-path inaccessible';
         const inaccessibleNote = item.accessible ? '' : ' • not accessible from this environment';
@@ -497,15 +510,13 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
               <div class="entry-main">
                 <div class="entry-header">
                   <div class="entry-title">\${title}</div>
+                  \${currentBadge}
                   <div class="entry-meta">\${meta}</div>
                 </div>
                 \${gitCounts}
                 <div class="\${pathClass}">\${entryPath}\${escapeHtml(inaccessibleNote)}</div>
                 <div class="entry-actions">
-                  <button class="mini-button" data-action="open-current" data-id="\${id}">Open Here</button>
-                  <button class="mini-button" data-action="open-new" data-id="\${id}">Open New Window</button>
-                  <button class="mini-button remove" data-action="remove-one" data-id="\${id}">Remove</button>
-                  <button class="mini-button remove" data-action="delete-remove-one" data-id="\${id}">Delete and Remove</button>
+                  \${actionButtons}
                 </div>
               </div>
             </div>
@@ -843,10 +854,14 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
 export function activate(context: vscode.ExtensionContext): void {
   const store = new KnownWorkspaceStore(context);
   const provider = new KnownWorkspacesViewProvider(context, store);
+  const currentWorkspaceSync = new CurrentWorkspaceGitSync(store, provider);
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(KnownWorkspacesViewProvider.viewType, provider)
   );
+
+  context.subscriptions.push(currentWorkspaceSync);
+  void currentWorkspaceSync.initialize().then(() => currentWorkspaceSync.sync());
 
   context.subscriptions.push(
     vscode.commands.registerCommand('workspacePicker.openKnown', async () => {
@@ -864,6 +879,7 @@ export function activate(context: vscode.ExtensionContext): void {
       try {
         const added = await addCurrentEntry(store);
         if (added) {
+          await currentWorkspaceSync.sync();
           await provider.refresh();
         }
       } catch (error) {
@@ -887,6 +903,80 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {}
 
+class CurrentWorkspaceGitSync implements vscode.Disposable {
+  private readonly disposables: vscode.Disposable[] = [];
+  private syncInFlight?: Promise<void>;
+  private initialized = false;
+
+  constructor(
+    private readonly store: KnownWorkspaceStore,
+    private readonly provider: KnownWorkspacesViewProvider
+  ) {}
+
+  async initialize(): Promise<void> {
+    if (this.initialized) {
+      return;
+    }
+
+    this.initialized = true;
+    const gitApi = await getGitExtensionApi();
+    if (!gitApi) {
+      return;
+    }
+
+    this.disposables.push(gitApi.onDidOpenRepository((repository) => {
+      this.registerRepository(repository);
+      void this.sync();
+    }));
+
+    for (const repository of gitApi.repositories) {
+      this.registerRepository(repository);
+    }
+  }
+
+  dispose(): void {
+    for (const disposable of this.disposables) {
+      disposable.dispose();
+    }
+  }
+
+  async sync(): Promise<void> {
+    await this.initialize();
+
+    if (this.syncInFlight) {
+      await this.syncInFlight;
+      return;
+    }
+
+    this.syncInFlight = this.syncCurrentWorkspaceGitInfo();
+    try {
+      await this.syncInFlight;
+    } finally {
+      this.syncInFlight = undefined;
+    }
+  }
+
+  private registerRepository(repository: GitRepository): void {
+    this.disposables.push(repository.state.onDidChange(() => {
+      void this.sync();
+    }));
+  }
+
+  private async syncCurrentWorkspaceGitInfo(): Promise<void> {
+    const entries = await this.store.list();
+    const currentEntry = await findCurrentWorkspaceEntry(entries, this.store);
+    if (!currentEntry) {
+      return;
+    }
+
+    const gitInfo = await detectGitInfo(currentEntry, this.store);
+    const changed = await this.store.updateGitInfoCacheIfChanged(currentEntry.id, gitInfo);
+    if (changed) {
+      await this.provider.refresh();
+    }
+  }
+}
+
 async function buildBasicEntryPresentation(
   entry: KnownWorkspaceEntry,
   store: KnownWorkspaceStore
@@ -907,7 +997,8 @@ async function buildBasicEntryPresentation(
     label: getEntryLabel(entry),
     gitInfo: cachedGitInfo,
     accessible,
-    originLabel: getOriginLabel(entry)
+    originLabel: getOriginLabel(entry),
+    isCurrentWorkspace: await isCurrentWorkspaceEntry(entry, store)
   };
 }
 
@@ -927,6 +1018,24 @@ async function addCurrentEntry(store: KnownWorkspaceStore): Promise<boolean> {
   return true;
 }
 
+async function isCurrentWorkspaceEntry(
+  entry: KnownWorkspaceEntry,
+  store: KnownWorkspaceStore
+): Promise<boolean> {
+  const currentWorkspaceUri = getCurrentWorkspaceUri();
+  if (!currentWorkspaceUri || currentWorkspaceUri.scheme !== 'file') {
+    return false;
+  }
+
+  const currentWorkspacePath = currentWorkspaceUri.fsPath;
+  if (pathsMatch(entry.path, currentWorkspacePath)) {
+    return true;
+  }
+
+  const resolvedPath = await store.resolveEntryPath(entry);
+  return Boolean(resolvedPath && pathsMatch(resolvedPath, currentWorkspacePath));
+}
+
 async function findCurrentWorkspaceEntry(
   entries: KnownWorkspaceEntry[],
   store: KnownWorkspaceStore
@@ -936,15 +1045,8 @@ async function findCurrentWorkspaceEntry(
     return undefined;
   }
 
-  const currentWorkspacePath = currentWorkspaceUri.fsPath;
-
   for (const entry of entries) {
-    if (pathsMatch(entry.path, currentWorkspacePath)) {
-      return entry;
-    }
-
-    const resolvedPath = await store.resolveEntryPath(entry);
-    if (resolvedPath && pathsMatch(resolvedPath, currentWorkspacePath)) {
+    if (await isCurrentWorkspaceEntry(entry, store)) {
       return entry;
     }
   }
@@ -1367,6 +1469,24 @@ function formatRemoteLabel(remoteUrl: string): string {
   return match?.[1] ?? remoteUrl;
 }
 
+async function getGitExtensionApi(): Promise<GitExtensionApi | undefined> {
+  const gitExtension = vscode.extensions.getExtension('vscode.git');
+  if (!gitExtension) {
+    return undefined;
+  }
+
+  const exports = gitExtension.isActive ? gitExtension.exports : await gitExtension.activate();
+  if (!exports || typeof (exports as { getAPI?: unknown }).getAPI !== 'function') {
+    return undefined;
+  }
+
+  try {
+    return (exports as { getAPI(version: number): GitExtensionApi }).getAPI(1);
+  } catch {
+    return undefined;
+  }
+}
+
 class KnownWorkspaceStore {
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -1403,9 +1523,9 @@ class KnownWorkspaceStore {
 
       const fsPath = uri.fsPath;
       const kind: EntryKind = fsPath.endsWith('.code-workspace') ? 'workspace' : 'folder';
-      const entry = createEntry(fsPath, kind);
       const key = fsPath.toLowerCase();
       const existing = byKey.get(key);
+      const entry = createEntry(fsPath, kind, existing);
       byKey.set(key, entry);
 
       if (existing) {
@@ -1447,9 +1567,9 @@ class KnownWorkspaceStore {
     await this.write(data);
   }
 
-  async updateGitInfoCache(updates: Array<{ id: string; gitInfo?: GitInfo }>): Promise<void> {
+  async updateGitInfoCache(updates: Array<{ id: string; gitInfo?: GitInfo }>): Promise<boolean> {
     if (updates.length === 0) {
-      return;
+      return false;
     }
 
     const data = await this.read();
@@ -1487,6 +1607,12 @@ class KnownWorkspaceStore {
     if (changed) {
       await this.write(data);
     }
+
+    return changed;
+  }
+
+  async updateGitInfoCacheIfChanged(id: string, gitInfo?: GitInfo): Promise<boolean> {
+    return this.updateGitInfoCache([{ id, gitInfo }]);
   }
 
   async resolveEntryPath(entry: KnownWorkspaceEntry): Promise<string | undefined> {
@@ -1553,14 +1679,15 @@ function isCachedGitInfo(value: unknown): value is CachedGitInfo {
     && (candidate.remoteLabel === undefined || typeof candidate.remoteLabel === 'string');
 }
 
-function createEntry(entryPath: string, kind: EntryKind): KnownWorkspaceEntry {
+function createEntry(entryPath: string, kind: EntryKind, existing?: KnownWorkspaceEntry): KnownWorkspaceEntry {
   return {
     id: createEntryId(entryPath),
     path: entryPath,
     kind,
-    addedAt: new Date().toISOString(),
+    addedAt: existing?.addedAt ?? new Date().toISOString(),
     origin: detectOrigin(entryPath),
-    wslDistro: detectWslDistro(entryPath)
+    wslDistro: detectWslDistro(entryPath),
+    cachedGitInfo: existing?.cachedGitInfo
   };
 }
 
