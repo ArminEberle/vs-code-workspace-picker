@@ -169,14 +169,17 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
       groupOrder
     });
 
-    void this.hydrateGitInfo(entries, token);
+    void this.hydrateCurrentWorkspaceGitInfo(entries, token);
   }
 
-  private async hydrateGitInfo(entries: KnownWorkspaceEntry[], token: number): Promise<void> {
-    const enriched = await Promise.all(entries.map(async (entry) => ({
-      id: entry.id,
-      gitInfo: await detectGitInfo(entry, this.store)
-    })));
+  private async hydrateCurrentWorkspaceGitInfo(entries: KnownWorkspaceEntry[], token: number): Promise<void> {
+    const currentEntry = await findCurrentWorkspaceEntry(entries, this.store);
+    if (!currentEntry) {
+      return;
+    }
+
+    const gitInfo = await detectGitInfo(currentEntry, this.store);
+    const enriched: Array<{ id: string; gitInfo?: GitInfo }> = [{ id: currentEntry.id, gitInfo }];
 
     await this.store.updateGitInfoCache(enriched);
 
@@ -914,6 +917,31 @@ async function addCurrentEntry(store: KnownWorkspaceStore): Promise<boolean> {
   return true;
 }
 
+async function findCurrentWorkspaceEntry(
+  entries: KnownWorkspaceEntry[],
+  store: KnownWorkspaceStore
+): Promise<KnownWorkspaceEntry | undefined> {
+  const currentWorkspaceUri = getCurrentWorkspaceUri();
+  if (!currentWorkspaceUri || currentWorkspaceUri.scheme !== 'file') {
+    return undefined;
+  }
+
+  const currentWorkspacePath = currentWorkspaceUri.fsPath;
+
+  for (const entry of entries) {
+    if (pathsMatch(entry.path, currentWorkspacePath)) {
+      return entry;
+    }
+
+    const resolvedPath = await store.resolveEntryPath(entry);
+    if (resolvedPath && pathsMatch(resolvedPath, currentWorkspacePath)) {
+      return entry;
+    }
+  }
+
+  return undefined;
+}
+
 async function addNewWorktree(store: KnownWorkspaceStore): Promise<void> {
   const repoContext = await getCurrentGitRepoContext();
   const branchName = await promptForNewBranchName(repoContext.repoRoot);
@@ -1626,6 +1654,14 @@ async function pathExists(targetPath: string): Promise<boolean> {
 
 function isWindowsPath(value: string): boolean {
   return /^[a-zA-Z]:\\/.test(value) || /^\\\\/.test(value);
+}
+
+function pathsMatch(left: string, right: string): boolean {
+  if (isWindowsPath(left) || isWindowsPath(right)) {
+    return left.toLowerCase() === right.toLowerCase();
+  }
+
+  return left === right;
 }
 
 function isWslEnvironment(): boolean {
