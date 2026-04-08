@@ -2,7 +2,7 @@
   "name": "vs-code-workspace-picker",
   "displayName": "VS Code Workspace Picker",
   "description": "A sidebar-based VS Code workspace launcher with WSL support, Git worktree creation, and quick switching between known workspaces.",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "publisher": "ArminEberle",
   "license": "MIT",
   "icon": "media/icon.png",
