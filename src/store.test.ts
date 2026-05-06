@@ -248,8 +248,62 @@ describe('KnownWorkspaceStore', () => {
     expect(metadata.groupOrder).toEqual(['remote/versioned']);
   });
 
+  it('does not bump the entry file mtime when re-adding the same path', async () => {
+    const { store, rootDir } = await createStore();
+    await store.addUris([{ scheme: 'file', fsPath: '/repo/one' }]);
+    const [entry] = await store.list();
+    const filePath = path.join(rootDir, 'entries', `${entry.id}.json`);
+    const mtimeBefore = (await fs.stat(filePath)).mtimeMs;
+
+    await wait(50);
+    await store.addUris([{ scheme: 'file', fsPath: '/repo/one' }]);
+    const mtimeAfter = (await fs.stat(filePath)).mtimeMs;
+
+    expect(mtimeAfter).toBe(mtimeBefore);
+  });
+
+  it('does not bump the metadata mtime when reorder is a no-op', async () => {
+    const { store, rootDir } = await createStore();
+    await store.addUris([
+      { scheme: 'file', fsPath: '/repo/one' },
+      { scheme: 'file', fsPath: '/repo/two' }
+    ]);
+    const entries = await store.list();
+    const metadataPath = path.join(rootDir, 'metadata.json');
+    const mtimeBefore = (await fs.stat(metadataPath)).mtimeMs;
+
+    await wait(50);
+    await store.reorder(entries.map((entry) => entry.id));
+    const mtimeAfter = (await fs.stat(metadataPath)).mtimeMs;
+
+    expect(mtimeAfter).toBe(mtimeBefore);
+  });
+
+  it('does not bump the open session mtime when the same heartbeat is re-upserted', async () => {
+    const { store, rootDir } = await createStore();
+    await store.addUris([{ scheme: 'file', fsPath: '/repo/one' }]);
+    const [entry] = await store.list();
+    const session: Parameters<KnownWorkspaceStore['upsertOpenSession']>[1] = {
+      sessionId: 'session-stable',
+      processId: 1,
+      lastSeenAt: '2024-05-01T00:00:00.000Z',
+      environment: 'linux',
+      hostName: 'devbox'
+    };
+
+    await store.upsertOpenSession(entry.id, session);
+    const filePath = path.join(rootDir, 'open-sessions', `${entry.id}__session-stable.json`);
+    const mtimeBefore = (await fs.stat(filePath)).mtimeMs;
+
+    await wait(50);
+    await store.upsertOpenSession(entry.id, session);
+    const mtimeAfter = (await fs.stat(filePath)).mtimeMs;
+
+    expect(mtimeAfter).toBe(mtimeBefore);
+  });
+
   it('prunes stale open workspace heartbeats without touching fresh ones', async () => {
-    const { store } = await createStore();
+    const { store, rootDir } = await createStore();
 
     await store.addUris([{ scheme: 'file', fsPath: '/repo/one' }]);
     const [entry] = await store.list();
@@ -269,12 +323,71 @@ describe('KnownWorkspaceStore', () => {
       hostName: 'devbox'
     });
 
+    const stalePath = path.join(rootDir, 'open-sessions', `${entry.id}__stale.json`);
+    const freshPath = path.join(rootDir, 'open-sessions', `${entry.id}__fresh.json`);
+    const staleTime = new Date('2024-05-01T00:00:00.000Z');
+    const freshTime = new Date('2024-05-01T00:00:25.000Z');
+    await fs.utimes(stalePath, staleTime, staleTime);
+    await fs.utimes(freshPath, freshTime, freshTime);
+
     await store.pruneOpenSessions(20_000, Date.parse('2024-05-01T00:00:30.000Z'));
 
     const sessionsByEntryId = await store.listOpenSessionsByEntryIds([entry.id]);
     expect(sessionsByEntryId.get(entry.id)).toEqual([
       expect.objectContaining({ sessionId: 'fresh' })
     ]);
+  });
+
+  it('touches an open session without rewriting its body', async () => {
+    const { store, rootDir } = await createStore();
+    await store.addUris([{ scheme: 'file', fsPath: '/repo/one' }]);
+    const [entry] = await store.list();
+
+    await store.upsertOpenSession(entry.id, {
+      sessionId: 'session-touch',
+      processId: 1,
+      lastSeenAt: '2024-05-01T00:00:00.000Z',
+      environment: 'linux',
+      hostName: 'devbox'
+    });
+    const filePath = path.join(rootDir, 'open-sessions', `${entry.id}__session-touch.json`);
+    const initialContent = await fs.readFile(filePath, 'utf8');
+    const initialMtime = (await fs.stat(filePath)).mtimeMs;
+
+    await wait(50);
+    await store.touchOpenSession(entry.id, 'session-touch');
+
+    const afterContent = await fs.readFile(filePath, 'utf8');
+    const afterMtime = (await fs.stat(filePath)).mtimeMs;
+    expect(afterContent).toBe(initialContent);
+    expect(afterMtime).toBeGreaterThan(initialMtime);
+  });
+
+  it('exposes a session lastSeenAt derived from the current file mtime', async () => {
+    const { store } = await createStore();
+    await store.addUris([{ scheme: 'file', fsPath: '/repo/one' }]);
+    const [entry] = await store.list();
+
+    await store.upsertOpenSession(entry.id, {
+      sessionId: 'session-mtime',
+      processId: 1,
+      lastSeenAt: '1970-01-01T00:00:00.000Z',
+      environment: 'linux',
+      hostName: 'devbox'
+    });
+
+    const sessionsBefore = await store.listOpenSessionsByEntryIds([entry.id]);
+    const before = sessionsBefore.get(entry.id)?.[0];
+    expect(before?.lastSeenAt).not.toBe('1970-01-01T00:00:00.000Z');
+    const beforeTime = Date.parse(before!.lastSeenAt);
+
+    await wait(50);
+    await store.touchOpenSession(entry.id, 'session-mtime');
+
+    const sessionsAfter = await store.listOpenSessionsByEntryIds([entry.id]);
+    const after = sessionsAfter.get(entry.id)?.[0];
+    const afterTime = Date.parse(after!.lastSeenAt);
+    expect(afterTime).toBeGreaterThan(beforeTime);
   });
 });
 
@@ -290,6 +403,10 @@ async function createStore(): Promise<{ store: KnownWorkspaceStore; rootDir: str
       resolveEntryPath: async (entry) => entry.path
     })
   };
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function createTestEntry(entryPath: string, addedAt: string): KnownWorkspaceEntry {

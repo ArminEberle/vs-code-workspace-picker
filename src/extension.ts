@@ -1,4 +1,5 @@
 import * as fs from 'fs/promises';
+import { watch as fsWatch, type FSWatcher } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { execFile } from 'child_process';
@@ -8,8 +9,8 @@ import { GitInfo, KnownWorkspaceEntry, KnownWorkspaceStore, OpenWorkspaceSession
 
 const execFileAsync = promisify(execFile);
 const EXTENSION_STORAGE_DIR = 'vs-code-workspace-picker';
-const OPEN_WORKSPACE_HEARTBEAT_MS = 10_000;
-const OPEN_WORKSPACE_STALE_MS = 30_000;
+const OPEN_WORKSPACE_HEARTBEAT_MS = 30_000;
+const OPEN_WORKSPACE_STALE_MS = 90_000;
 
 type EntryOrigin = 'windows' | 'wsl' | 'linux' | 'macos' | 'unknown';
 
@@ -67,6 +68,7 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'workspacePicker.knownWorkspaces';
 
   private view?: vscode.WebviewView;
+  private lastPostedStateJson?: string;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -177,12 +179,18 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
       this.sessionId,
       sessionsByEntryId.get(entry.id) ?? []
     )));
-    await this.view.webview.postMessage({
+    const message = {
       type: 'state',
       entries: presentation,
       groupOrder,
       canAddCurrent
-    });
+    };
+    const messageJson = JSON.stringify(message);
+    if (messageJson === this.lastPostedStateJson) {
+      return;
+    }
+    this.lastPostedStateJson = messageJson;
+    await this.view.webview.postMessage(message);
   }
 
   private getHtml(webview: vscode.Webview): string {
@@ -881,6 +889,9 @@ export function activate(context: vscode.ExtensionContext): WorkspacePickerExten
   const provider = new KnownWorkspacesViewProvider(context, store, sessionId);
   const currentWorkspaceSync = new CurrentWorkspaceGitSync(store, provider);
   const currentWorkspacePresenceSync = new CurrentWorkspacePresenceSync(store, provider, sessionId);
+  const storageWatcher = new StorageWatcher(store, () => {
+    void provider.refresh();
+  });
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(KnownWorkspacesViewProvider.viewType, provider)
@@ -888,8 +899,10 @@ export function activate(context: vscode.ExtensionContext): WorkspacePickerExten
 
   context.subscriptions.push(currentWorkspaceSync);
   context.subscriptions.push(currentWorkspacePresenceSync);
+  context.subscriptions.push(storageWatcher);
   void currentWorkspaceSync.initialize().then(() => currentWorkspaceSync.sync());
   void currentWorkspacePresenceSync.initialize().then(() => currentWorkspacePresenceSync.sync());
+  void storageWatcher.start();
 
   context.subscriptions.push(
     vscode.commands.registerCommand('workspacePicker.openKnown', async () => {
@@ -943,6 +956,80 @@ export function activate(context: vscode.ExtensionContext): WorkspacePickerExten
 
 export function deactivate(): void {
   activatedApi = undefined;
+}
+
+class StorageWatcher implements vscode.Disposable {
+  private readonly watchers: FSWatcher[] = [];
+  private debounceTimer?: NodeJS.Timeout;
+  private disposed = false;
+
+  constructor(
+    private readonly store: KnownWorkspaceStore,
+    private readonly onChanged: () => void,
+    private readonly debounceMs: number = 250
+  ) {}
+
+  async start(): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
+
+    try {
+      await this.store.ensureStorageDirectories();
+    } catch {
+      return;
+    }
+
+    if (this.disposed) {
+      return;
+    }
+
+    const dirs = await this.store.getStorageDirectories();
+    this.attach(dirs.rootDir);
+    this.attach(dirs.entriesDir);
+    this.attach(dirs.openSessionsDir);
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = undefined;
+    }
+    for (const watcher of this.watchers) {
+      try {
+        watcher.close();
+      } catch {
+        // ignore
+      }
+    }
+    this.watchers.length = 0;
+  }
+
+  private attach(dir: string): void {
+    try {
+      const watcher = fsWatch(dir, { persistent: false }, () => this.scheduleRefresh());
+      watcher.on('error', () => {
+        // best-effort; the next refresh from a heartbeat or user action will recover
+      });
+      this.watchers.push(watcher);
+    } catch {
+      // ignore; some platforms may not support watching every directory
+    }
+  }
+
+  private scheduleRefresh(): void {
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+    }
+    this.debounceTimer = setTimeout(() => {
+      this.debounceTimer = undefined;
+      if (this.disposed) {
+        return;
+      }
+      this.onChanged();
+    }, this.debounceMs);
+  }
 }
 
 class CurrentWorkspaceGitSync implements vscode.Disposable {
@@ -1077,19 +1164,35 @@ class CurrentWorkspacePresenceSync implements vscode.Disposable {
     }
 
     if (currentEntry) {
-      await this.store.upsertOpenSession(currentEntry.id, {
-        sessionId: this.sessionId,
-        processId: process.pid,
-        lastSeenAt: new Date().toISOString(),
-        environment: getRuntimeEnvironmentOrigin(),
-        hostName: os.hostname(),
-        appName: vscode.env.appName
-      });
-      this.currentEntryId = currentEntry.id;
+      if (this.currentEntryId === currentEntry.id) {
+        try {
+          await this.store.touchOpenSession(currentEntry.id, this.sessionId);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+            await this.store.upsertOpenSession(currentEntry.id, this.buildSessionBody());
+          } else {
+            throw error;
+          }
+        }
+      } else {
+        await this.store.upsertOpenSession(currentEntry.id, this.buildSessionBody());
+        this.currentEntryId = currentEntry.id;
+      }
     }
 
     await this.store.pruneOpenSessions(OPEN_WORKSPACE_STALE_MS * 4);
     await this.provider.refresh();
+  }
+
+  private buildSessionBody(): OpenWorkspaceSession {
+    return {
+      sessionId: this.sessionId,
+      processId: process.pid,
+      lastSeenAt: new Date().toISOString(),
+      environment: getRuntimeEnvironmentOrigin(),
+      hostName: os.hostname(),
+      appName: vscode.env.appName
+    };
   }
 }
 
@@ -1494,15 +1597,31 @@ function getFreshestOtherOpenSession(
   currentSessionId: string
 ): OpenWorkspaceSession | undefined {
   const cutoff = Date.now() - OPEN_WORKSPACE_STALE_MS;
+  const localHostName = os.hostname();
   const otherSessions = sessions
     .filter((session) => session.sessionId !== currentSessionId)
     .filter((session) => {
+      if (session.hostName === localHostName) {
+        return isProcessAlive(session.processId);
+      }
       const lastSeen = Date.parse(session.lastSeenAt);
       return !Number.isNaN(lastSeen) && lastSeen >= cutoff;
     })
     .sort((left, right) => Date.parse(right.lastSeenAt) - Date.parse(left.lastSeenAt));
 
   return otherSessions[0];
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
 }
 
 function formatOpenSessionLabel(session: OpenWorkspaceSession, otherSessionCount: number): string {

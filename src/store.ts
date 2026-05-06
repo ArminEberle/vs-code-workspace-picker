@@ -79,6 +79,10 @@ const LEGACY_STORAGE_FILE_NAME = 'known-workspaces.json';
 export const PERSISTENCE_VERSION = 3;
 
 export class KnownWorkspaceStore {
+  private readonly entryFileCache = new Map<string, { mtimeMs: number; entry: KnownWorkspaceEntry }>();
+  private metadataFileCache?: { mtimeMs: number; metadata: StoreMetadata };
+  private readonly sessionFileCache = new Map<string, { mtimeMs: number; entryId: string; session: OpenWorkspaceSession }>();
+
   constructor(private readonly options: KnownWorkspaceStoreOptions) {}
 
   async list(): Promise<KnownWorkspaceEntry[]> {
@@ -214,6 +218,21 @@ export class KnownWorkspaceStore {
     return this.options.resolveEntryPath(entry);
   }
 
+  async ensureStorageDirectories(): Promise<void> {
+    const paths = await this.getPaths();
+    await fs.mkdir(paths.entriesDir, { recursive: true });
+    await fs.mkdir(paths.openSessionsDir, { recursive: true });
+  }
+
+  async getStorageDirectories(): Promise<{ rootDir: string; entriesDir: string; openSessionsDir: string }> {
+    const paths = await this.getPaths();
+    return {
+      rootDir: paths.rootDir,
+      entriesDir: paths.entriesDir,
+      openSessionsDir: paths.openSessionsDir
+    };
+  }
+
   async listOpenSessionsByEntryIds(entryIds: string[]): Promise<Map<string, OpenWorkspaceSession[]>> {
     const idSet = new Set(entryIds);
     const sessions = await this.readOpenSessionFiles();
@@ -235,16 +254,35 @@ export class KnownWorkspaceStore {
   async upsertOpenSession(entryId: string, session: OpenWorkspaceSession): Promise<void> {
     const paths = await this.getPaths();
     await fs.mkdir(paths.openSessionsDir, { recursive: true });
-    await fs.writeFile(
-      this.getOpenSessionFilePath(entryId, session.sessionId, paths),
-      `${JSON.stringify(session, null, 2)}\n`,
-      'utf8'
-    );
+    const filePath = this.getOpenSessionFilePath(entryId, session.sessionId, paths);
+    const content = `${JSON.stringify(session, null, 2)}\n`;
+    const wrote = await this.writeFileIfChanged(filePath, content);
+    if (wrote) {
+      try {
+        const stat = await fs.stat(filePath);
+        this.sessionFileCache.set(filePath, { mtimeMs: stat.mtimeMs, entryId, session });
+      } catch {
+        this.sessionFileCache.delete(filePath);
+      }
+    }
+  }
+
+  async touchOpenSession(entryId: string, sessionId: string): Promise<void> {
+    const paths = await this.getPaths();
+    const filePath = this.getOpenSessionFilePath(entryId, sessionId, paths);
+    const now = new Date();
+    await fs.utimes(filePath, now, now);
+    const cached = this.sessionFileCache.get(filePath);
+    if (cached) {
+      this.sessionFileCache.set(filePath, { ...cached, mtimeMs: now.getTime() });
+    }
   }
 
   async removeOpenSession(entryId: string, sessionId: string): Promise<void> {
     const paths = await this.getPaths();
-    await this.safeUnlink(this.getOpenSessionFilePath(entryId, sessionId, paths));
+    const filePath = this.getOpenSessionFilePath(entryId, sessionId, paths);
+    await this.safeUnlink(filePath);
+    this.sessionFileCache.delete(filePath);
   }
 
   async pruneOpenSessions(maxAgeMs: number, now = Date.now()): Promise<void> {
@@ -255,9 +293,11 @@ export class KnownWorkspaceStore {
       return Number.isNaN(lastSeen) || now - lastSeen > maxAgeMs;
     });
 
-    await Promise.all(staleSessions.map((sessionRecord) => this.safeUnlink(
-      this.getOpenSessionFilePath(sessionRecord.entryId, sessionRecord.session.sessionId, paths)
-    )));
+    await Promise.all(staleSessions.map(async (sessionRecord) => {
+      const filePath = this.getOpenSessionFilePath(sessionRecord.entryId, sessionRecord.session.sessionId, paths);
+      this.sessionFileCache.delete(filePath);
+      await this.safeUnlink(filePath);
+    }));
   }
 
   private async readState(): Promise<StoreState> {
@@ -303,13 +343,13 @@ export class KnownWorkspaceStore {
   private async readMetadata(paths?: StorePaths): Promise<StoreMetadata> {
     const resolvedPaths = paths ?? await this.getPaths();
 
+    let mtimeMs: number;
     try {
-      const raw = await fs.readFile(resolvedPaths.metadataFilePath, 'utf8');
-      const parsed = JSON.parse(raw) as Partial<StoreMetadata>;
-      return migrateMetadata(parsed);
+      mtimeMs = (await fs.stat(resolvedPaths.metadataFilePath)).mtimeMs;
     } catch (error) {
       const nodeError = error as NodeJS.ErrnoException;
       if (nodeError.code === 'ENOENT') {
+        this.metadataFileCache = undefined;
         const legacyData = await this.readLegacyData(resolvedPaths);
         return migrateMetadata({
           version: 2,
@@ -317,32 +357,79 @@ export class KnownWorkspaceStore {
           groupOrder: legacyData.groupOrder
         });
       }
-
       throw error;
     }
+
+    if (this.metadataFileCache && this.metadataFileCache.mtimeMs === mtimeMs) {
+      return this.metadataFileCache.metadata;
+    }
+
+    const raw = await fs.readFile(resolvedPaths.metadataFilePath, 'utf8');
+    const parsed = JSON.parse(raw) as Partial<StoreMetadata>;
+    const metadata = migrateMetadata(parsed);
+    this.metadataFileCache = { mtimeMs, metadata };
+    return metadata;
   }
 
   private async readEntryFiles(paths?: StorePaths): Promise<KnownWorkspaceEntry[]> {
     const resolvedPaths = paths ?? await this.getPaths();
 
+    let dirEntries;
     try {
-      const dirEntries = await fs.readdir(resolvedPaths.entriesDir, { withFileTypes: true });
-      const entries = await Promise.all(dirEntries
-        .filter((entry) => entry.isFile() && entry.name.endsWith(ENTRY_FILE_EXTENSION))
-        .map(async (entry) => {
-          const raw = await fs.readFile(path.join(resolvedPaths.entriesDir, entry.name), 'utf8');
-          const parsed = JSON.parse(raw) as unknown;
-          return isKnownWorkspaceEntry(parsed) ? parsed : undefined;
-        }));
-
-      return entries.filter((entry): entry is KnownWorkspaceEntry => Boolean(entry));
+      dirEntries = await fs.readdir(resolvedPaths.entriesDir, { withFileTypes: true });
     } catch (error) {
       const nodeError = error as NodeJS.ErrnoException;
       if (nodeError.code === 'ENOENT') {
+        this.entryFileCache.clear();
         return [];
       }
-
       throw error;
+    }
+
+    const presentFiles = dirEntries.filter((entry) => entry.isFile() && entry.name.endsWith(ENTRY_FILE_EXTENSION));
+    const presentPaths = new Set<string>();
+
+    const entries = await Promise.all(presentFiles.map(async (entry) => {
+      const filePath = path.join(resolvedPaths.entriesDir, entry.name);
+      presentPaths.add(filePath);
+      return this.readEntryFileCached(filePath);
+    }));
+
+    for (const cachedPath of [...this.entryFileCache.keys()]) {
+      if (!presentPaths.has(cachedPath)) {
+        this.entryFileCache.delete(cachedPath);
+      }
+    }
+
+    return entries.filter((entry): entry is KnownWorkspaceEntry => Boolean(entry));
+  }
+
+  private async readEntryFileCached(filePath: string): Promise<KnownWorkspaceEntry | undefined> {
+    let mtimeMs: number;
+    try {
+      mtimeMs = (await fs.stat(filePath)).mtimeMs;
+    } catch {
+      this.entryFileCache.delete(filePath);
+      return undefined;
+    }
+
+    const cached = this.entryFileCache.get(filePath);
+    if (cached && cached.mtimeMs === mtimeMs) {
+      return cached.entry;
+    }
+
+    try {
+      const raw = await fs.readFile(filePath, 'utf8');
+      const parsed = JSON.parse(raw) as unknown;
+      if (!isKnownWorkspaceEntry(parsed)) {
+        this.entryFileCache.delete(filePath);
+        return undefined;
+      }
+      this.entryFileCache.set(filePath, { mtimeMs, entry: parsed });
+      return parsed;
+    } catch {
+      this.entryFileCache.delete(filePath);
+      return undefined;
     }
   }
 
@@ -378,36 +465,78 @@ export class KnownWorkspaceStore {
   ): Promise<Array<{ entryId: string; session: OpenWorkspaceSession }>> {
     const resolvedPaths = paths ?? await this.getPaths();
 
+    let dirEntries;
     try {
-      const dirEntries = await fs.readdir(resolvedPaths.openSessionsDir, { withFileTypes: true });
-      const sessions = await Promise.all(dirEntries
-        .filter((entry) => entry.isFile() && entry.name.endsWith(ENTRY_FILE_EXTENSION))
-        .map(async (entry) => {
-          const parsedName = parseOpenSessionFileName(entry.name);
-          if (!parsedName) {
-            return undefined;
-          }
-
-          const raw = await fs.readFile(path.join(resolvedPaths.openSessionsDir, entry.name), 'utf8');
-          const parsed = JSON.parse(raw) as unknown;
-          if (!isOpenWorkspaceSession(parsed)) {
-            return undefined;
-          }
-
-          return {
-            entryId: parsedName.entryId,
-            session: parsed
-          };
-        }));
-
-      return sessions.filter((session): session is { entryId: string; session: OpenWorkspaceSession } => Boolean(session));
+      dirEntries = await fs.readdir(resolvedPaths.openSessionsDir, { withFileTypes: true });
     } catch (error) {
       const nodeError = error as NodeJS.ErrnoException;
       if (nodeError.code === 'ENOENT') {
+        this.sessionFileCache.clear();
         return [];
       }
-
       throw error;
+    }
+
+    const presentFiles = dirEntries.filter((entry) => entry.isFile() && entry.name.endsWith(ENTRY_FILE_EXTENSION));
+    const presentPaths = new Set<string>();
+
+    const sessions = await Promise.all(presentFiles.map(async (entry) => {
+      const parsedName = parseOpenSessionFileName(entry.name);
+      if (!parsedName) {
+        return undefined;
+      }
+      const filePath = path.join(resolvedPaths.openSessionsDir, entry.name);
+      presentPaths.add(filePath);
+      return this.readSessionFileCached(filePath, parsedName.entryId);
+    }));
+
+    for (const cachedPath of [...this.sessionFileCache.keys()]) {
+      if (!presentPaths.has(cachedPath)) {
+        this.sessionFileCache.delete(cachedPath);
+      }
+    }
+
+    return sessions.filter((session): session is { entryId: string; session: OpenWorkspaceSession } => Boolean(session));
+  }
+
+  private async readSessionFileCached(
+    filePath: string,
+    entryId: string
+  ): Promise<{ entryId: string; session: OpenWorkspaceSession } | undefined> {
+    let mtimeMs: number;
+    try {
+      mtimeMs = (await fs.stat(filePath)).mtimeMs;
+    } catch {
+      this.sessionFileCache.delete(filePath);
+      return undefined;
+    }
+
+    const cached = this.sessionFileCache.get(filePath);
+    if (cached && cached.entryId === entryId) {
+      if (cached.mtimeMs !== mtimeMs) {
+        this.sessionFileCache.set(filePath, { ...cached, mtimeMs });
+      }
+      return {
+        entryId,
+        session: { ...cached.session, lastSeenAt: new Date(mtimeMs).toISOString() }
+      };
+    }
+
+    try {
+      const raw = await fs.readFile(filePath, 'utf8');
+      const parsed = JSON.parse(raw) as unknown;
+      if (!isOpenWorkspaceSession(parsed)) {
+        this.sessionFileCache.delete(filePath);
+        return undefined;
+      }
+      this.sessionFileCache.set(filePath, { mtimeMs, entryId, session: parsed });
+      return {
+        entryId,
+        session: { ...parsed, lastSeenAt: new Date(mtimeMs).toISOString() }
+      };
+    } catch {
+      this.sessionFileCache.delete(filePath);
+      return undefined;
     }
   }
 
@@ -416,16 +545,46 @@ export class KnownWorkspaceStore {
 
     await fs.mkdir(resolvedPaths.entriesDir, { recursive: true });
 
-    await Promise.all(entries.map((entry) => fs.writeFile(
-      this.getEntryFilePath(entry.id, resolvedPaths),
-      `${JSON.stringify(entry, null, 2)}\n`,
-      'utf8'
-    )));
+    await Promise.all(entries.map((entry) => this.writeEntryFile(entry, resolvedPaths)));
+  }
+
+  private async writeEntryFile(entry: KnownWorkspaceEntry, paths: StorePaths): Promise<void> {
+    const filePath = this.getEntryFilePath(entry.id, paths);
+    const content = `${JSON.stringify(entry, null, 2)}\n`;
+    const wrote = await this.writeFileIfChanged(filePath, content);
+    if (wrote) {
+      try {
+        const stat = await fs.stat(filePath);
+        this.entryFileCache.set(filePath, { mtimeMs: stat.mtimeMs, entry });
+      } catch {
+        this.entryFileCache.delete(filePath);
+      }
+    }
   }
 
   private async deleteEntryFiles(ids: string[], paths?: StorePaths): Promise<void> {
     const resolvedPaths = paths ?? await this.getPaths();
-    await Promise.all(ids.map((id) => this.safeUnlink(this.getEntryFilePath(id, resolvedPaths))));
+    await Promise.all(ids.map(async (id) => {
+      const filePath = this.getEntryFilePath(id, resolvedPaths);
+      await this.safeUnlink(filePath);
+      this.entryFileCache.delete(filePath);
+    }));
+  }
+
+  private async writeFileIfChanged(filePath: string, content: string): Promise<boolean> {
+    try {
+      const existing = await fs.readFile(filePath, 'utf8');
+      if (existing === content) {
+        return false;
+      }
+    } catch (error) {
+      const nodeError = error as NodeJS.ErrnoException;
+      if (nodeError.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+    await fs.writeFile(filePath, content, 'utf8');
+    return true;
   }
 
   private async updateMetadata(
@@ -440,7 +599,16 @@ export class KnownWorkspaceStore {
       groupOrder: dedupeIds(nextMetadata.groupOrder)
     };
     await fs.mkdir(resolvedPaths.rootDir, { recursive: true });
-    await fs.writeFile(resolvedPaths.metadataFilePath, `${JSON.stringify(sanitized, null, 2)}\n`, 'utf8');
+    const content = `${JSON.stringify(sanitized, null, 2)}\n`;
+    const wrote = await this.writeFileIfChanged(resolvedPaths.metadataFilePath, content);
+    if (wrote) {
+      try {
+        const stat = await fs.stat(resolvedPaths.metadataFilePath);
+        this.metadataFileCache = { mtimeMs: stat.mtimeMs, metadata: sanitized };
+      } catch {
+        this.metadataFileCache = undefined;
+      }
+    }
   }
 
   private async getPaths(): Promise<StorePaths> {

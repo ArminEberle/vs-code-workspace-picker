@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run *)",
+      "Bash(npm test *)",
+      "Bash(code --version)",
+      "Bash(code --install-extension /home/armin/work/private/vscode-workspace-picker/vs-code-workspace-picker-0.0.8.vsix --force)"
+    ]
+  }
+}
