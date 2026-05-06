@@ -6,3 +6,8 @@ node_modules/**
 tsconfig.json
 package-lock.json
 .gitignore
+dist/test/**
+test-fixtures/**
+vitest.config.ts
+tests/**
+playwright.vscode.config.ts

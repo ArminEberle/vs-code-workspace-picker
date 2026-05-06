@@ -19,9 +19,56 @@ Useful commands:
 
 ```bash
 npm run build
+npm test
+npm run test:integration
+npm run test:ui
 npm run watch
 npm run package:vsix
 npm run release:patch
+```
+
+`npm test` runs the fast Vitest unit suite.
+
+`npm run test:integration` launches a real Extension Development Host with `@vscode/test-electron`, opens the fixture workspace in `test-fixtures/basic-workspace`, runs the extension, and verifies persistence through the extension API.
+
+In WSL, the test runners try to auto-detect a standard Windows VS Code install by querying `%LOCALAPPDATA%` through `cmd.exe` and checking the usual install paths.
+
+If auto-detection does not find the right binary, you can point the runner at an existing VS Code executable:
+
+```bash
+VSCODE_EXECUTABLE_PATH="/path/to/code" npm run test:integration
+```
+
+`npm run test:ui` uses Playwright's Electron support against a desktop VS Code executable and exercises the extension through the actual UI. The current suite covers:
+
+- single-instance smoke: focus the view, click `Add This`, and verify the workspace appears
+- two-instance sync: launch two VS Code instances with separate user-data directories but a shared Workspace Picker storage root, click `Add This` in one instance, click `Refresh` in the other, and verify the entry appears there too
+
+Run it like this:
+
+```bash
+VSCODE_EXECUTABLE_PATH="/path/to/code" npm run test:ui
+```
+
+The UI suite expects a real desktop VS Code binary. The remote CLI binary that ships with `code` inside WSL is not enough.
+
+Do not run `npm run test:ui` from inside WSL against Windows VS Code. Playwright can launch `Code.exe`, but the Electron control channel does not attach reliably across the WSL/Windows boundary.
+
+Use one of these instead:
+
+- run `npm run test:ui` from Windows PowerShell or CMD
+- run it against a native Linux desktop VS Code build outside WSL
+
+The WSL auto-detection is still useful for the non-UI integration runner. In a normal WSL setup with Windows VS Code installed in the default location, this should now work without setting anything:
+
+```bash
+npm run test:integration
+```
+
+or explicitly:
+
+```bash
+npm run test:ui
 ```
 
 ## Project Files That Matter For Releases

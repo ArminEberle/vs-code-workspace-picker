@@ -97,12 +97,19 @@
     "release:patch": "bash scripts/release.sh patch",
     "release:minor": "bash scripts/release.sh minor",
     "release:major": "bash scripts/release.sh major",
-    "pretest": "npm run build"
+    "pretest": "npm run build",
+    "test": "vitest run",
+    "test:integration": "npm run build && node ./scripts/run-integration-tests.mjs",
+    "test:ui": "playwright test -c ./playwright.vscode.config.ts",
+    "test:all": "npm run test && npm run test:integration"
   },
   "devDependencies": {
+    "@playwright/test": "^1.59.1",
     "@types/node": "^22.15.2",
     "@types/vscode": "^1.90.0",
+    "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.7.1",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "vitest": "^4.1.4"
   }
 }

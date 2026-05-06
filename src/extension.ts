@@ -4,44 +4,19 @@ import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import * as vscode from 'vscode';
+import { GitInfo, KnownWorkspaceEntry, KnownWorkspaceStore, OpenWorkspaceSession } from './store';
 
 const execFileAsync = promisify(execFile);
-const STORAGE_FILE_NAME = 'known-workspaces.json';
 const EXTENSION_STORAGE_DIR = 'vs-code-workspace-picker';
+const OPEN_WORKSPACE_HEARTBEAT_MS = 10_000;
+const OPEN_WORKSPACE_STALE_MS = 30_000;
 
-type EntryKind = 'folder' | 'workspace';
 type EntryOrigin = 'windows' | 'wsl' | 'linux' | 'macos' | 'unknown';
 
-interface KnownWorkspaceEntry {
-  id: string;
-  path: string;
-  kind: EntryKind;
-  addedAt: string;
-  origin: EntryOrigin;
-  wslDistro?: string;
-  cachedGitInfo?: CachedGitInfo;
-}
-
-interface StoredData {
-  version: 2;
-  entries: KnownWorkspaceEntry[];
-  groupOrder: string[];
-}
-
-interface CachedGitInfo {
-  repoName?: string;
-  branch?: string;
-  remoteGroupKey?: string;
-  remoteLabel?: string;
-}
-
-interface GitInfo {
-  repoName: string;
-  branch: string;
-  stagedCount?: number;
-  unstagedCount?: number;
-  remoteGroupKey?: string;
-  remoteLabel?: string;
+interface EntryOpenState {
+  label: string;
+  lastSeenLabel: string;
+  canFocus: boolean;
 }
 
 interface EntryPresentation {
@@ -51,6 +26,7 @@ interface EntryPresentation {
   accessible: boolean;
   originLabel: string;
   isCurrentWorkspace: boolean;
+  openState?: EntryOpenState;
 }
 
 type WebviewMessage =
@@ -59,6 +35,7 @@ type WebviewMessage =
   | { type: 'addCurrent' }
   | { type: 'refresh' }
   | { type: 'openEntry'; id: string; newWindow: boolean }
+  | { type: 'focusOpenEntry'; id: string }
   | { type: 'reorderEntries'; ids: string[] }
   | { type: 'reorderGroups'; groupIds: string[] }
   | { type: 'removeEntry'; id: string }
@@ -77,6 +54,15 @@ interface GitRepositoryState {
   onDidChange(listener: () => void): vscode.Disposable;
 }
 
+interface WorkspacePickerExtensionApi {
+  listEntries(): Promise<KnownWorkspaceEntry[]>;
+  getGroupOrder(): Promise<string[]>;
+  getStorageRootDir(): Promise<string>;
+  addEntriesForTests(paths: string[]): Promise<void>;
+}
+
+let activatedApi: WorkspacePickerExtensionApi | undefined;
+
 class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'workspacePicker.knownWorkspaces';
 
@@ -84,7 +70,8 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
 
   constructor(
     private readonly context: vscode.ExtensionContext,
-    private readonly store: KnownWorkspaceStore
+    private readonly store: KnownWorkspaceStore,
+    private readonly sessionId: string
   ) {}
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
@@ -135,6 +122,14 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
           await openKnownEntry(entry, message.newWindow);
           return;
         }
+        case 'focusOpenEntry': {
+          const entry = await this.store.findById(message.id);
+          if (!entry) {
+            return;
+          }
+          await focusOpenEntry(entry);
+          return;
+        }
         case 'reorderEntries':
           await this.store.reorder(message.ids);
           await this.postState();
@@ -175,7 +170,13 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
     const entries = await this.store.list();
     const groupOrder = await this.store.getGroupOrder();
     const canAddCurrent = !await hasCurrentWorkspaceEntry(entries, this.store);
-    const presentation = await Promise.all(entries.map((entry) => buildBasicEntryPresentation(entry, this.store)));
+    const sessionsByEntryId = await this.store.listOpenSessionsByEntryIds(entries.map((entry) => entry.id));
+    const presentation = await Promise.all(entries.map((entry) => buildBasicEntryPresentation(
+      entry,
+      this.store,
+      this.sessionId,
+      sessionsByEntryId.get(entry.id) ?? []
+    )));
     await this.view.webview.postMessage({
       type: 'state',
       entries: presentation,
@@ -493,10 +494,18 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
         const currentBadge = item.isCurrentWorkspace
           ? '<div class="entry-badge">YOU ARE HERE</div>'
           : '';
+        const openStateMeta = item.openState
+          ? '<div class="entry-meta">' + escapeHtml(item.openState.label + ' • ' + item.openState.lastSeenLabel) + '</div>'
+          : '';
+        const focusButton = item.openState && item.openState.canFocus
+          ? '<button class="mini-button" data-action="focus-open" data-id="' + id + '">Focus Other Window</button>'
+          : '';
         const actionButtons = item.isCurrentWorkspace
-          ? '<button class="mini-button remove" data-action="remove-one" data-id="' + id + '">Remove</button>'
+          ? focusButton
+            + '<button class="mini-button remove" data-action="remove-one" data-id="' + id + '">Remove</button>'
           : '<button class="mini-button" data-action="open-current" data-id="' + id + '">Open Here</button>'
             + '<button class="mini-button" data-action="open-new" data-id="' + id + '">Open New Window</button>'
+            + focusButton
             + '<button class="mini-button remove" data-action="remove-one" data-id="' + id + '">Remove</button>'
             + '<button class="mini-button remove" data-action="delete-remove-one" data-id="' + id + '">Delete and Remove</button>';
         const entryPath = escapeHtml(item.entry.path);
@@ -514,6 +523,7 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
                   <div class="entry-meta">\${meta}</div>
                 </div>
                 \${gitCounts}
+                \${openStateMeta}
                 <div class="\${pathClass}">\${entryPath}\${escapeHtml(inaccessibleNote)}</div>
                 <div class="entry-actions">
                   \${actionButtons}
@@ -613,6 +623,11 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
 
       if (action === 'open-new') {
         vscode.postMessage({ type: 'openEntry', id, newWindow: true });
+        return;
+      }
+
+      if (action === 'focus-open') {
+        vscode.postMessage({ type: 'focusOpenEntry', id });
         return;
       }
 
@@ -851,17 +866,30 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
   }
 }
 
-export function activate(context: vscode.ExtensionContext): void {
-  const store = new KnownWorkspaceStore(context);
-  const provider = new KnownWorkspacesViewProvider(context, store);
+export function activate(context: vscode.ExtensionContext): WorkspacePickerExtensionApi {
+  if (activatedApi) {
+    return activatedApi;
+  }
+
+  const sessionId = createRuntimeSessionId();
+  const store = new KnownWorkspaceStore({
+    getStorageRootDir: async () => getStorageRootDir(context),
+    detectOrigin,
+    detectWslDistro,
+    resolveEntryPath
+  });
+  const provider = new KnownWorkspacesViewProvider(context, store, sessionId);
   const currentWorkspaceSync = new CurrentWorkspaceGitSync(store, provider);
+  const currentWorkspacePresenceSync = new CurrentWorkspacePresenceSync(store, provider, sessionId);
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(KnownWorkspacesViewProvider.viewType, provider)
   );
 
   context.subscriptions.push(currentWorkspaceSync);
+  context.subscriptions.push(currentWorkspacePresenceSync);
   void currentWorkspaceSync.initialize().then(() => currentWorkspaceSync.sync());
+  void currentWorkspacePresenceSync.initialize().then(() => currentWorkspacePresenceSync.sync());
 
   context.subscriptions.push(
     vscode.commands.registerCommand('workspacePicker.openKnown', async () => {
@@ -899,9 +927,23 @@ export function activate(context: vscode.ExtensionContext): void {
       await provider.reveal();
     })
   );
+
+  activatedApi = {
+    listEntries: () => store.list(),
+    getGroupOrder: () => store.getGroupOrder(),
+    getStorageRootDir: () => getStorageRootDir(context),
+    addEntriesForTests: async (paths) => {
+      await store.addUris(paths.map((entryPath) => vscode.Uri.file(entryPath)));
+      await provider.refresh();
+    }
+  };
+
+  return activatedApi;
 }
 
-export function deactivate(): void {}
+export function deactivate(): void {
+  activatedApi = undefined;
+}
 
 class CurrentWorkspaceGitSync implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
@@ -964,22 +1006,98 @@ class CurrentWorkspaceGitSync implements vscode.Disposable {
 
   private async syncCurrentWorkspaceGitInfo(): Promise<void> {
     const entries = await this.store.list();
-    const currentEntry = await findCurrentWorkspaceEntry(entries, this.store);
-    if (!currentEntry) {
+    if (entries.length === 0) {
       return;
     }
 
-    const gitInfo = await detectGitInfo(currentEntry, this.store);
-    const changed = await this.store.updateGitInfoCacheIfChanged(currentEntry.id, gitInfo);
+    const updates = await Promise.all(entries.map(async (entry) => ({
+      id: entry.id,
+      gitInfo: await detectGitInfo(entry, this.store)
+    })));
+    const changed = await this.store.updateGitInfoCache(updates);
     if (changed) {
       await this.provider.refresh();
     }
   }
 }
 
+class CurrentWorkspacePresenceSync implements vscode.Disposable {
+  private interval?: NodeJS.Timeout;
+  private currentEntryId?: string;
+  private syncInFlight?: Promise<void>;
+
+  constructor(
+    private readonly store: KnownWorkspaceStore,
+    private readonly provider: KnownWorkspacesViewProvider,
+    private readonly sessionId: string
+  ) {}
+
+  async initialize(): Promise<void> {
+    if (this.interval) {
+      return;
+    }
+
+    this.interval = setInterval(() => {
+      void this.sync();
+    }, OPEN_WORKSPACE_HEARTBEAT_MS);
+  }
+
+  dispose(): void {
+    if (this.interval) {
+      clearInterval(this.interval);
+      this.interval = undefined;
+    }
+
+    if (this.currentEntryId) {
+      void this.store.removeOpenSession(this.currentEntryId, this.sessionId);
+    }
+  }
+
+  async sync(): Promise<void> {
+    if (this.syncInFlight) {
+      await this.syncInFlight;
+      return;
+    }
+
+    this.syncInFlight = this.syncPresence();
+    try {
+      await this.syncInFlight;
+    } finally {
+      this.syncInFlight = undefined;
+    }
+  }
+
+  private async syncPresence(): Promise<void> {
+    const entries = await this.store.list();
+    const currentEntry = await findCurrentWorkspaceEntry(entries, this.store);
+
+    if (this.currentEntryId && (!currentEntry || currentEntry.id !== this.currentEntryId)) {
+      await this.store.removeOpenSession(this.currentEntryId, this.sessionId);
+      this.currentEntryId = undefined;
+    }
+
+    if (currentEntry) {
+      await this.store.upsertOpenSession(currentEntry.id, {
+        sessionId: this.sessionId,
+        processId: process.pid,
+        lastSeenAt: new Date().toISOString(),
+        environment: getRuntimeEnvironmentOrigin(),
+        hostName: os.hostname(),
+        appName: vscode.env.appName
+      });
+      this.currentEntryId = currentEntry.id;
+    }
+
+    await this.store.pruneOpenSessions(OPEN_WORKSPACE_STALE_MS * 4);
+    await this.provider.refresh();
+  }
+}
+
 async function buildBasicEntryPresentation(
   entry: KnownWorkspaceEntry,
-  store: KnownWorkspaceStore
+  store: KnownWorkspaceStore,
+  currentSessionId: string,
+  openSessions: OpenWorkspaceSession[]
 ): Promise<EntryPresentation> {
   const resolvedPath = await store.resolveEntryPath(entry);
   const accessible = resolvedPath ? await pathExists(resolvedPath) : false;
@@ -992,13 +1110,22 @@ async function buildBasicEntryPresentation(
       }
     : undefined;
 
+  const freshestOtherSession = getFreshestOtherOpenSession(openSessions, currentSessionId);
+
   return {
     entry,
     label: getEntryLabel(entry),
     gitInfo: cachedGitInfo,
     accessible,
     originLabel: getOriginLabel(entry),
-    isCurrentWorkspace: await isCurrentWorkspaceEntry(entry, store)
+    isCurrentWorkspace: await isCurrentWorkspaceEntry(entry, store),
+    openState: freshestOtherSession
+      ? {
+          label: formatOpenSessionLabel(freshestOtherSession, openSessions.length - 1),
+          lastSeenLabel: formatRelativeTime(freshestOtherSession.lastSeenAt),
+          canFocus: true
+        }
+      : undefined
   };
 }
 
@@ -1151,6 +1278,45 @@ async function openKnownEntry(entry: KnownWorkspaceEntry, forceNewWindow: boolea
   await vscode.commands.executeCommand('vscode.openFolder', uri, forceNewWindow);
 }
 
+async function focusOpenEntry(entry: KnownWorkspaceEntry): Promise<void> {
+  if (shouldLaunchInWindowsWslSession(entry)) {
+    const distro = entry.wslDistro;
+    if (!distro) {
+      throw new Error('This WSL workspace does not have a recorded distro name, so it cannot be focused automatically.');
+    }
+
+    const remoteUri = vscode.Uri.from({
+      scheme: 'vscode-remote',
+      authority: `wsl+${distro}`,
+      path: getWslRemotePath(entry)
+    });
+    await runWindowsCodeCommand(['--folder-uri', remoteUri.toString()]);
+    return;
+  }
+
+  if (shouldLaunchInWindowsLocalSession(entry)) {
+    await runWindowsCodeCommand([entry.path]);
+    return;
+  }
+
+  const resolvedPath = await resolveEntryPath(entry);
+  if (!resolvedPath) {
+    throw new Error(`The workspace path "${entry.path}" is not accessible from this environment.`);
+  }
+
+  if (process.platform === 'win32') {
+    await runWindowsCodeCommand([resolvedPath]);
+    return;
+  }
+
+  if (process.platform === 'darwin') {
+    await execFileAsync('open', ['-a', 'Visual Studio Code', resolvedPath]);
+    return;
+  }
+
+  await execFileAsync('code', [resolvedPath]);
+}
+
 async function detectGitInfo(
   entry: KnownWorkspaceEntry,
   store: KnownWorkspaceStore
@@ -1297,6 +1463,74 @@ function getOriginLabel(entry: KnownWorkspaceEntry): string {
   }
 
   return entry.origin.toUpperCase();
+}
+
+function getRuntimeEnvironmentOrigin(): EntryOrigin {
+  if (isWslEnvironment()) {
+    return 'wsl';
+  }
+
+  if (process.platform === 'win32') {
+    return 'windows';
+  }
+
+  if (process.platform === 'darwin') {
+    return 'macos';
+  }
+
+  if (process.platform === 'linux') {
+    return 'linux';
+  }
+
+  return 'unknown';
+}
+
+function createRuntimeSessionId(): string {
+  return `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function getFreshestOtherOpenSession(
+  sessions: OpenWorkspaceSession[],
+  currentSessionId: string
+): OpenWorkspaceSession | undefined {
+  const cutoff = Date.now() - OPEN_WORKSPACE_STALE_MS;
+  const otherSessions = sessions
+    .filter((session) => session.sessionId !== currentSessionId)
+    .filter((session) => {
+      const lastSeen = Date.parse(session.lastSeenAt);
+      return !Number.isNaN(lastSeen) && lastSeen >= cutoff;
+    })
+    .sort((left, right) => Date.parse(right.lastSeenAt) - Date.parse(left.lastSeenAt));
+
+  return otherSessions[0];
+}
+
+function formatOpenSessionLabel(session: OpenWorkspaceSession, otherSessionCount: number): string {
+  const environmentLabel = session.environment === 'wsl'
+    ? 'WSL'
+    : session.environment.toUpperCase();
+  const extraCount = Math.max(0, otherSessionCount - 1);
+  const suffix = extraCount > 0 ? ` +${extraCount} more` : '';
+  return `Open in ${environmentLabel} on ${session.hostName}${suffix}`;
+}
+
+function formatRelativeTime(value: string): string {
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) {
+    return 'heartbeat unknown';
+  }
+
+  const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+  if (seconds < 5) {
+    return 'heartbeat just now';
+  }
+
+  if (seconds < 60) {
+    return `heartbeat ${seconds}s ago`;
+  }
+
+  const minutes = Math.round(seconds / 60);
+  return `heartbeat ${minutes}m ago`;
 }
 
 function asErrorMessage(error: unknown): string {
@@ -1487,220 +1721,6 @@ async function getGitExtensionApi(): Promise<GitExtensionApi | undefined> {
   }
 }
 
-class KnownWorkspaceStore {
-  constructor(private readonly context: vscode.ExtensionContext) {}
-
-  async list(): Promise<KnownWorkspaceEntry[]> {
-    const data = await this.read();
-    return data.entries;
-  }
-
-  async getGroupOrder(): Promise<string[]> {
-    const data = await this.read();
-    return data.groupOrder;
-  }
-
-  async findById(id: string): Promise<KnownWorkspaceEntry | undefined> {
-    const entries = await this.list();
-    return entries.find((entry) => entry.id === id);
-  }
-
-  async findByIds(ids: string[]): Promise<KnownWorkspaceEntry[]> {
-    const idSet = new Set(ids);
-    const entries = await this.list();
-    return entries.filter((entry) => idSet.has(entry.id));
-  }
-
-  async addUris(uris: vscode.Uri[]): Promise<void> {
-    const data = await this.read();
-    const byKey = new Map(data.entries.map((entry) => [entry.path.toLowerCase(), entry]));
-    const orderedEntries = [...data.entries];
-
-    for (const uri of uris) {
-      if (uri.scheme !== 'file') {
-        continue;
-      }
-
-      const fsPath = uri.fsPath;
-      const kind: EntryKind = fsPath.endsWith('.code-workspace') ? 'workspace' : 'folder';
-      const key = fsPath.toLowerCase();
-      const existing = byKey.get(key);
-      const entry = createEntry(fsPath, kind, existing);
-      byKey.set(key, entry);
-
-      if (existing) {
-        const index = orderedEntries.findIndex((candidate) => candidate.id === existing.id);
-        if (index >= 0) {
-          orderedEntries[index] = entry;
-        }
-      } else {
-        orderedEntries.push(entry);
-      }
-    }
-
-    data.entries = orderedEntries.filter((entry) => byKey.has(entry.path.toLowerCase()));
-    await this.write(data);
-  }
-
-  async remove(ids: string[]): Promise<void> {
-    const idSet = new Set(ids);
-    const data = await this.read();
-    data.entries = data.entries.filter((entry) => !idSet.has(entry.id));
-    await this.write(data);
-  }
-
-  async reorder(ids: string[]): Promise<void> {
-    const data = await this.read();
-    const byId = new Map(data.entries.map((entry) => [entry.id, entry]));
-    const reordered = ids
-      .map((id) => byId.get(id))
-      .filter((entry): entry is KnownWorkspaceEntry => Boolean(entry));
-    const remaining = data.entries.filter((entry) => !ids.includes(entry.id));
-    data.entries = [...reordered, ...remaining];
-    await this.write(data);
-  }
-
-  async reorderGroups(groupIds: string[]): Promise<void> {
-    const data = await this.read();
-    const remaining = data.groupOrder.filter((groupId) => !groupIds.includes(groupId));
-    data.groupOrder = [...groupIds, ...remaining];
-    await this.write(data);
-  }
-
-  async updateGitInfoCache(updates: Array<{ id: string; gitInfo?: GitInfo }>): Promise<boolean> {
-    if (updates.length === 0) {
-      return false;
-    }
-
-    const data = await this.read();
-    const updateMap = new Map(updates.map((update) => [update.id, update.gitInfo]));
-    let changed = false;
-
-    data.entries = data.entries.map((entry) => {
-      if (!updateMap.has(entry.id)) {
-        return entry;
-      }
-
-      const gitInfo = updateMap.get(entry.id);
-      const nextCachedGitInfo = gitInfo
-        ? {
-            repoName: gitInfo.repoName,
-            branch: gitInfo.branch,
-            remoteGroupKey: gitInfo.remoteGroupKey,
-            remoteLabel: gitInfo.remoteLabel
-          }
-        : undefined;
-
-      const currentCache = entry.cachedGitInfo;
-      const isSame = JSON.stringify(currentCache ?? null) === JSON.stringify(nextCachedGitInfo ?? null);
-      if (isSame) {
-        return entry;
-      }
-
-      changed = true;
-      return {
-        ...entry,
-        cachedGitInfo: nextCachedGitInfo
-      };
-    });
-
-    if (changed) {
-      await this.write(data);
-    }
-
-    return changed;
-  }
-
-  async updateGitInfoCacheIfChanged(id: string, gitInfo?: GitInfo): Promise<boolean> {
-    return this.updateGitInfoCache([{ id, gitInfo }]);
-  }
-
-  async resolveEntryPath(entry: KnownWorkspaceEntry): Promise<string | undefined> {
-    return resolveEntryPath(entry);
-  }
-
-  private async read(): Promise<StoredData> {
-    const filePath = await getStorageFilePath(this.context);
-
-    try {
-      const raw = await fs.readFile(filePath, 'utf8');
-      const parsed = JSON.parse(raw) as Partial<StoredData>;
-      return {
-        version: 2,
-        entries: Array.isArray(parsed.entries) ? parsed.entries.filter(isKnownWorkspaceEntry) : [],
-        groupOrder: Array.isArray(parsed.groupOrder)
-          ? parsed.groupOrder.filter((value): value is string => typeof value === 'string')
-          : []
-      };
-    } catch (error) {
-      const nodeError = error as NodeJS.ErrnoException;
-      if (nodeError.code === 'ENOENT') {
-        return {
-          version: 2,
-          entries: [],
-          groupOrder: []
-        };
-      }
-
-      throw error;
-    }
-  }
-
-  private async write(data: StoredData): Promise<void> {
-    const filePath = await getStorageFilePath(this.context);
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.writeFile(filePath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
-  }
-}
-
-function isKnownWorkspaceEntry(value: unknown): value is KnownWorkspaceEntry {
-  if (!value || typeof value !== 'object') {
-    return false;
-  }
-
-  const candidate = value as Partial<KnownWorkspaceEntry>;
-  return typeof candidate.id === 'string'
-    && typeof candidate.path === 'string'
-    && (candidate.kind === 'folder' || candidate.kind === 'workspace')
-    && typeof candidate.addedAt === 'string'
-    && typeof candidate.origin === 'string'
-    && (candidate.cachedGitInfo === undefined || isCachedGitInfo(candidate.cachedGitInfo));
-}
-
-function isCachedGitInfo(value: unknown): value is CachedGitInfo {
-  if (!value || typeof value !== 'object') {
-    return false;
-  }
-
-  const candidate = value as Partial<CachedGitInfo>;
-  return (candidate.repoName === undefined || typeof candidate.repoName === 'string')
-    && (candidate.branch === undefined || typeof candidate.branch === 'string')
-    && (candidate.remoteGroupKey === undefined || typeof candidate.remoteGroupKey === 'string')
-    && (candidate.remoteLabel === undefined || typeof candidate.remoteLabel === 'string');
-}
-
-function createEntry(entryPath: string, kind: EntryKind, existing?: KnownWorkspaceEntry): KnownWorkspaceEntry {
-  return {
-    id: createEntryId(entryPath),
-    path: entryPath,
-    kind,
-    addedAt: existing?.addedAt ?? new Date().toISOString(),
-    origin: detectOrigin(entryPath),
-    wslDistro: detectWslDistro(entryPath),
-    cachedGitInfo: existing?.cachedGitInfo
-  };
-}
-
-function createEntryId(entryPath: string): string {
-  const normalized = entryPath.toLowerCase();
-  let hash = 0;
-  for (let index = 0; index < normalized.length; index += 1) {
-    hash = ((hash << 5) - hash) + normalized.charCodeAt(index);
-    hash |= 0;
-  }
-  return `entry-${Math.abs(hash)}`;
-}
-
 function detectOrigin(entryPath: string): EntryOrigin {
   if (detectWslDistro(entryPath)) {
     return 'wsl';
@@ -1733,13 +1753,18 @@ function detectWslDistro(entryPath: string): string | undefined {
   return undefined;
 }
 
-async function getStorageFilePath(context: vscode.ExtensionContext): Promise<string> {
+async function getStorageRootDir(context: vscode.ExtensionContext): Promise<string> {
+  const overridePath = process.env.WORKSPACE_PICKER_STORAGE_ROOT;
+  if (overridePath) {
+    return overridePath;
+  }
+
   const sharedWindowsPath = await getSharedWindowsStoragePath();
   if (sharedWindowsPath) {
     return sharedWindowsPath;
   }
 
-  return path.join(context.globalStorageUri.fsPath, STORAGE_FILE_NAME);
+  return context.globalStorageUri.fsPath;
 }
 
 async function getSharedWindowsStoragePath(): Promise<string | undefined> {
@@ -1749,7 +1774,7 @@ async function getSharedWindowsStoragePath(): Promise<string | undefined> {
       return undefined;
     }
 
-    return path.join(appData, 'Code', 'User', EXTENSION_STORAGE_DIR, STORAGE_FILE_NAME);
+    return path.join(appData, 'Code', 'User', EXTENSION_STORAGE_DIR);
   }
 
   if (!isWslEnvironment()) {
@@ -1763,7 +1788,7 @@ async function getSharedWindowsStoragePath(): Promise<string | undefined> {
       return undefined;
     }
 
-    return toWslPathFromWindows(path.join(windowsAppData, 'Code', 'User', EXTENSION_STORAGE_DIR, STORAGE_FILE_NAME));
+    return toWslPathFromWindows(path.join(windowsAppData, 'Code', 'User', EXTENSION_STORAGE_DIR));
   } catch {
     return undefined;
   }
