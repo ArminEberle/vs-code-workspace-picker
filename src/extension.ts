@@ -6,6 +6,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import * as vscode from 'vscode';
 import { GitInfo, KnownWorkspaceEntry, KnownWorkspaceStore, OpenWorkspaceSession } from './store';
+import { getPreferredNewWorktreeWorkspacePath } from './worktreeWorkspace';
 
 const execFileAsync = promisify(execFile);
 const EXTENSION_STORAGE_DIR = 'vs-code-workspace-picker';
@@ -34,6 +35,7 @@ type WebviewMessage =
   | { type: 'ready' }
   | { type: 'addNewWorktree' }
   | { type: 'addCurrent' }
+  | { type: 'gitFetch' }
   | { type: 'refresh' }
   | { type: 'openEntry'; id: string; newWindow: boolean }
   | { type: 'focusOpenEntry'; id: string }
@@ -116,6 +118,10 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
           }
           return;
         }
+        case 'gitFetch':
+          await fetchCurrentGitRepository();
+          await this.postState();
+          return;
         case 'openEntry': {
           const entry = await this.store.findById(message.id);
           if (!entry) {
@@ -455,6 +461,7 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
     <div class="actions">
       <button class="button primary" data-action="add-current">Add This</button>
       <button class="button" data-action="add-new-worktree">Add New Worktree</button>
+      <button class="button" data-action="git-fetch">Git Fetch</button>
       <button class="button" data-action="refresh">Refresh</button>
     </div>
     <div id="content"></div>
@@ -612,6 +619,11 @@ class KnownWorkspacesViewProvider implements vscode.WebviewViewProvider {
 
       if (action === 'add-new-worktree') {
         vscode.postMessage({ type: 'addNewWorktree' });
+        return;
+      }
+
+      if (action === 'git-fetch') {
+        vscode.postMessage({ type: 'gitFetch' });
         return;
       }
 
@@ -1248,6 +1260,17 @@ async function addCurrentEntry(store: KnownWorkspaceStore): Promise<boolean> {
   return true;
 }
 
+async function fetchCurrentGitRepository(): Promise<void> {
+  const repoContext = await getCurrentGitRepoContext();
+  await vscode.window.withProgress({
+    location: vscode.ProgressLocation.Notification,
+    title: 'Workspace Picker: Fetching Git branches'
+  }, async () => {
+    await execFileAsync('git', ['-C', repoContext.repoRoot, 'fetch', '--all', '--prune']);
+  });
+  void vscode.window.showInformationMessage('Fetched Git branches for the current repository.');
+}
+
 async function isCurrentWorkspaceEntry(
   entry: KnownWorkspaceEntry,
   store: KnownWorkspaceStore
@@ -1293,6 +1316,23 @@ async function hasCurrentWorkspaceEntry(
 
 async function addNewWorktree(store: KnownWorkspaceStore): Promise<void> {
   const repoContext = await getCurrentGitRepoContext();
+  const mode = await promptForWorktreeMode();
+  if (!mode) {
+    return;
+  }
+
+  if (mode === 'newBranch') {
+    await addNewBranchWorktree(store, repoContext);
+    return;
+  }
+
+  await addExistingBranchWorktree(store, repoContext);
+}
+
+async function addNewBranchWorktree(
+  store: KnownWorkspaceStore,
+  repoContext: GitRepoContext
+): Promise<void> {
   const branchName = await promptForNewBranchName(repoContext.repoRoot);
   if (!branchName) {
     return;
@@ -1309,8 +1349,64 @@ async function addNewWorktree(store: KnownWorkspaceStore): Promise<void> {
   }
 
   await execFileAsync('git', ['-C', repoContext.repoRoot, 'worktree', 'add', '-b', branchName, targetPath, baseBranch]);
-  await store.addUris([vscode.Uri.file(targetPath)]);
+  const workspacePath = await getNewWorktreeWorkspacePath(repoContext, targetPath);
+  await addWorkspacePathWithGitInfo(store, workspacePath);
   void vscode.window.showInformationMessage(`Created worktree "${branchName}" at ${targetPath}`);
+}
+
+async function addExistingBranchWorktree(
+  store: KnownWorkspaceStore,
+  repoContext: GitRepoContext
+): Promise<void> {
+  const branchName = await promptForExistingBranch(repoContext.repoRoot);
+  if (!branchName) {
+    return;
+  }
+
+  const targetPath = getSuggestedExistingBranchWorktreePath(repoContext.workspaceRoot, branchName);
+  if (await pathExists(targetPath)) {
+    throw new Error(`The target worktree folder already exists: ${targetPath}`);
+  }
+
+  await execFileAsync('git', ['-C', repoContext.repoRoot, 'worktree', 'add', targetPath, branchName]);
+  const workspacePath = await getNewWorktreeWorkspacePath(repoContext, targetPath);
+  await addWorkspacePathWithGitInfo(store, workspacePath);
+  void vscode.window.showInformationMessage(`Created worktree for "${branchName}" at ${targetPath}`);
+}
+
+async function getNewWorktreeWorkspacePath(repoContext: GitRepoContext, worktreeRoot: string): Promise<string> {
+  const preferredPath = getPreferredNewWorktreeWorkspacePath({
+    repoRoot: repoContext.repoRoot,
+    currentWorkspaceRoot: repoContext.workspaceRoot,
+    currentWorkspaceFile: repoContext.workspaceFile,
+    worktreeRoot
+  });
+  if (await pathExists(preferredPath)) {
+    return preferredPath;
+  }
+
+  const folderFallbackPath = getPreferredNewWorktreeWorkspacePath({
+    repoRoot: repoContext.repoRoot,
+    currentWorkspaceRoot: repoContext.workspaceRoot,
+    worktreeRoot
+  });
+  if (await pathExists(folderFallbackPath)) {
+    return folderFallbackPath;
+  }
+
+  return worktreeRoot;
+}
+
+async function addWorkspacePathWithGitInfo(store: KnownWorkspaceStore, workspacePath: string): Promise<void> {
+  await store.addUris([vscode.Uri.file(workspacePath)]);
+
+  const entries = await store.list();
+  const entry = entries.find((candidate) => pathsMatch(candidate.path, workspacePath));
+  if (!entry) {
+    return;
+  }
+
+  await store.updateGitInfoCacheIfChanged(entry.id, await detectGitInfo(entry, store));
 }
 
 async function confirmAndRemoveEntries(store: KnownWorkspaceStore, entries: KnownWorkspaceEntry[]): Promise<void> {
@@ -1543,6 +1639,7 @@ function countGitStatusEntries(statusOutput: string): { stagedCount: number; uns
 interface GitRepoContext {
   repoRoot: string;
   workspaceRoot: string;
+  workspaceFile?: string;
 }
 
 interface GitWorkspaceInfo {
@@ -1553,6 +1650,10 @@ interface GitWorkspaceInfo {
 
 interface BranchQuickPickItem extends vscode.QuickPickItem {
   refName: string;
+}
+
+interface WorktreeModeQuickPickItem extends vscode.QuickPickItem {
+  mode: 'newBranch' | 'existingBranch';
 }
 
 function getEntryLabel(entry: KnownWorkspaceEntry): string {
@@ -1667,6 +1768,9 @@ async function getCurrentGitRepoContext(): Promise<GitRepoContext> {
   }
 
   const workspaceRoot = workspaceFolder.uri.fsPath;
+  const workspaceFile = vscode.workspace.workspaceFile?.scheme === 'file'
+    ? vscode.workspace.workspaceFile.fsPath
+    : undefined;
 
   try {
     const { stdout } = await execFileAsync('git', ['-C', workspaceRoot, 'rev-parse', '--show-toplevel']);
@@ -1675,7 +1779,7 @@ async function getCurrentGitRepoContext(): Promise<GitRepoContext> {
       throw new Error('No git repository was found for the current workspace.');
     }
 
-    return { repoRoot, workspaceRoot };
+    return { repoRoot, workspaceRoot, workspaceFile };
   } catch {
     throw new Error('The current workspace is not inside a git repository.');
   }
@@ -1708,6 +1812,25 @@ async function deleteEntryFromDisk(entry: KnownWorkspaceEntry, store: KnownWorks
     recursive: entry.kind === 'folder',
     force: false
   });
+}
+
+async function promptForWorktreeMode(): Promise<WorktreeModeQuickPickItem['mode'] | undefined> {
+  return vscode.window.showQuickPick<WorktreeModeQuickPickItem>([
+    {
+      label: 'Create new branch',
+      description: 'Create a branch and worktree',
+      mode: 'newBranch'
+    },
+    {
+      label: 'Use existing branch',
+      description: 'Add a worktree for a local branch',
+      mode: 'existingBranch'
+    }
+  ], {
+    title: 'Add New Worktree',
+    placeHolder: 'Choose how to create the worktree',
+    ignoreFocusOut: true
+  }).then((item) => item?.mode);
 }
 
 async function promptForNewBranchName(repoRoot: string): Promise<string | undefined> {
@@ -1748,6 +1871,17 @@ async function promptForBaseBranch(repoRoot: string, branchName: string): Promis
   }).then((item) => item?.refName);
 }
 
+async function promptForExistingBranch(repoRoot: string): Promise<string | undefined> {
+  const branches = await listAvailableExistingBranches(repoRoot);
+  return vscode.window.showQuickPick(branches, {
+    title: 'Add New Worktree',
+    placeHolder: 'Choose an existing local branch',
+    ignoreFocusOut: true,
+    matchOnDescription: true,
+    matchOnDetail: true
+  }).then((item) => item?.refName);
+}
+
 async function listBaseBranches(repoRoot: string): Promise<BranchQuickPickItem[]> {
   const { stdout } = await execFileAsync('git', [
     '-C',
@@ -1758,7 +1892,52 @@ async function listBaseBranches(repoRoot: string): Promise<BranchQuickPickItem[]
     'refs/remotes'
   ]);
 
-  const items = stdout
+  const items = parseBranchQuickPickItems(stdout);
+
+  if (items.length === 0) {
+    throw new Error('No local or remote branches were found in the current repository.');
+  }
+
+  return items;
+}
+
+async function listAvailableExistingBranches(repoRoot: string): Promise<BranchQuickPickItem[]> {
+  const [branchItems, checkedOutBranches] = await Promise.all([
+    listLocalBranchItems(repoRoot),
+    listCheckedOutLocalBranches(repoRoot)
+  ]);
+  const availableItems = branchItems.filter((item) => !checkedOutBranches.has(item.refName));
+
+  if (availableItems.length === 0) {
+    throw new Error('No local branches are available for a new worktree. Branches already checked out in a worktree are hidden.');
+  }
+
+  return availableItems;
+}
+
+async function listLocalBranchItems(repoRoot: string): Promise<BranchQuickPickItem[]> {
+  const { stdout } = await execFileAsync('git', [
+    '-C',
+    repoRoot,
+    'for-each-ref',
+    '--format=%(refname)%00%(refname:short)%00%(objectname:short)%00%(subject)',
+    'refs/heads'
+  ]);
+
+  return parseBranchQuickPickItems(stdout);
+}
+
+async function listCheckedOutLocalBranches(repoRoot: string): Promise<Set<string>> {
+  const { stdout } = await execFileAsync('git', ['-C', repoRoot, 'worktree', 'list', '--porcelain']);
+  const branches = stdout
+    .split('\n')
+    .map((line) => /^branch refs\/heads\/(.+)$/.exec(line.trim())?.[1])
+    .filter((branchName): branchName is string => Boolean(branchName));
+  return new Set(branches);
+}
+
+function parseBranchQuickPickItems(stdout: string): BranchQuickPickItem[] {
+  return stdout
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean)
@@ -1774,12 +1953,6 @@ async function listBaseBranches(repoRoot: string): Promise<BranchQuickPickItem[]
       detail: [item.shortSha, item.subject].filter(Boolean).join(' • '),
       refName: item.refName
     }));
-
-  if (items.length === 0) {
-    throw new Error('No local or remote branches were found in the current repository.');
-  }
-
-  return items;
 }
 
 function compareBranchNames(left: string, right: string): number {
@@ -1796,6 +1969,10 @@ function getSuggestedWorktreePath(workspaceRoot: string, branchName: string): st
   const parentPath = path.dirname(workspaceRoot);
   const workspaceName = getPathBaseName(workspaceRoot);
   return path.join(parentPath, `${workspaceName}-${sanitizeForPathSegment(branchName)}`);
+}
+
+function getSuggestedExistingBranchWorktreePath(workspaceRoot: string, branchName: string): string {
+  return path.join(path.dirname(workspaceRoot), sanitizeForPathSegment(branchName));
 }
 
 function sanitizeForPathSegment(value: string): string {

@@ -21,12 +21,15 @@ Instead of relying only on `Open Recent`, Workspace Picker gives you a persisten
 
 - Sidebar-based workspace launcher
 - Add the current folder or workspace with one click
+- Fetch the current Git repository from the picker before choosing worktree branches
 - Group workspaces by remote repository in accordion sections when a remote exists
 - Open a known entry in the current window or a new window
 - Drag entries to reorder them in the sidebar
 - Remove one or many entries from the list
 - Show Git repository and branch information for listed entries when available
 - Create a new Git worktree from the current repository
+- Choose between creating a new branch or using an existing local branch when adding a worktree
+- Add the newly created worktree to the picker as the matching `.code-workspace` file when one exists, otherwise as the matching folder
 - Pick the base branch for a new worktree from local branches and remote branches including `origin/...`
 - Store the workspace list in a way that can be shared between Windows and WSL when possible
 - Open WSL workspaces directly from a normal Windows VS Code session
